@@ -3,6 +3,12 @@ data/**
 !data/
 !data/.gitkeep
 
+notebooks/complex-assembly/**
+scripts/complex-assembly/**
+scripts/logs/**
+Stoic/** 
+
+.hf_cache/**
 
 # Python-generated files
 __pycache__/
@@ -18,3 +24,19 @@ wheels/
 
 # marimo 
 __marimo__/
+local_models/esm2/.gitattributes
+local_models/esm2/config.json
+local_models/esm2/model.safetensors
+local_models/esm2/pytorch_model.bin
+local_models/esm2/README.md
+local_models/esm2/special_tokens_map.json
+local_models/esm2/tf_model.h5
+local_models/esm2/tokenizer_config.json
+local_models/esm2/vocab.txt
+.env
+local_models/stoic/.gitattributes
+local_models/stoic/config.json
+local_models/stoic/Figure_architecture.png
+local_models/stoic/model.safetensors
+local_models/stoic/README.md
+notebooks/Dataframes/Yeast_Map/IntAct_yeast_proteins_uni_prot.csv

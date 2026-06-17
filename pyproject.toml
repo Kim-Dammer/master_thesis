@@ -3,10 +3,20 @@ name = "ProCompA"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
+    "af3io>=26.0",
+    "fastparquet>=2026.5.0",
+    "ipykernel>=7.2.0",
+    "lxml>=6.1.0",
     "marimo>=0.23.5",
+    "pandas>=3.0.3",
     "polars>=1.40.1",
+    "pooled-ppi",
+    "py3dmol>=2.5.4",
+    "pyarrow>=24.0.0",
+    "python-dotenv>=1.2.2",
+    "stoic",
 ]
 
 [build-system]
@@ -15,3 +25,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/procompa"]
+
+[tool.uv.sources]
+pooled-ppi = { git = "https://github.com/jurgjn/pooled-ppi.git", branch = "main" }
+stoic = { git = "https://github.com/PickyBinders/stoic.git" }
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.0",
+]
