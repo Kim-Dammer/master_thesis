@@ -34,7 +34,7 @@ SEQUENCES_PARQUET="/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.
 POOLED_PPI_DB="/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.04"
 COMBFOLD_SIF="/cluster/project/beltrao/shared/alphafold3/images/combfold_latest.sif"
 OUTPUT_BASE="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/first_setup/CombFold"
-MERGED_PDBS_DIR="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/merged_pdbs"
+MERGED_PDBS_DIR="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/homodimer_pdb_files/merged_pdbs"
 # ------------------------------------------------------------
 
 source "${VENV}/bin/activate"

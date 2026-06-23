@@ -5,14 +5,21 @@
 #SBATCH --output=logs/lookup_iptm_%j.out
 #SBATCH --error=logs/lookup_iptm_%j.err
 #SBATCH --time=04:00:00
-#SBATCH --cpus-per-task=10
-#SBATCH --mem-per-cpu=8G
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=200G
 
 # ===========================================================================
-# lookup_iptm.sbatch — High-speed vectorized ipTM lookup using Polars.
+# lookup_iptm.sbatch — Map best ipTM scores to protein pairs with batching.
+#
+# Reads a parquet of (protein_A, protein_B) pairs, joins against the
+# pooled-PPI yeast DB (order-independent, takes MAX iptm per pair),
+# and writes each batch to a separate part file to keep memory flat.
+# Parts are concatenated at the end into the final output.
+#
+# Memory profile: only the lookup table + one batch are in memory at a time.
 #
 # Usage:
-#    sbatch 08_lookup_iptm.sh
+#    sbatch 08_lookup_iptm_pairs.sh
 # ===========================================================================
 
 set -euo pipefail
@@ -25,100 +32,69 @@ source "${VENV}/bin/activate"
 
 mkdir -p logs
 
-echo "[$(date)] Starting high-performance ipTM lookup..."
+echo "[$(date)] Starting ipTM lookup with memory-efficient batching..."
 
 python - <<'EOF'
+import os
+import gc
 from pathlib import Path
 import sys
+import psutil
 import polars as pl
 import pooled_ppi
 
-# --- Hardcoded Dataset Paths ---
-CSV_PATH = Path("/cluster/project/beltrao/kdammer/master_thesis/notebooks/Dataframes/Yeast_Map/yeastmap_complex_pairs_with_scores_incl_db.csv")
+# --- Paths -----------------------------------------------------------------
+PAIRS_PATH = Path("/cluster/project/beltrao/kdammer/master_thesis/data/iPTM/yeast_protein_pairs.parquet")
 POOLED_PPI_DB = "/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.03"
-OUTPUT_PATH = Path("/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/iptm_scores.csv")
+OUTPUT_DIR = Path("/cluster/project/beltrao/kdammer/master_thesis/data/iPTM")
+OUTPUT_PATH = OUTPUT_DIR / "yeast_pairs_iptm_mapped.parquet"
+PARTS_PREFIX = "yeast_pairs_iptm_part_"
 
-PAIR_COL = "complex_pairs"
+BATCH_SIZE = 100_000
 
-def parse_pairs(entry: str | None) -> list[list[str]] | None:
-    """Parse a 'X-Y' or 'X-Y-Z' entry into sorted pairs."""
-    if entry is None:
-        return None
-    parts = [p.strip() for p in str(entry).split("-") if p.strip()]
-    pairs = []
-    n = len(parts)
-    for i in range(n):
-        for j in range(i + 1, n):
-            p1, p2 = parts[i], parts[j]
-            if p1 > p2:
-                p1, p2 = p2, p1
-            pairs.append([p1, p2])
-    return pairs
+def mem_gb():
+    """Current RSS in GB."""
+    return psutil.Process(os.getpid()).memory_info().rss / 1e9
 
-def main():
-    print(f"Reading {CSV_PATH} ...")
-    df = pl.read_csv(CSV_PATH)
-    print(f"  {df.height} rows, columns: {df.columns}")
+# --- Load & normalize the pooled-PPI DB ------------------------------------
+print(f"Loading pooled-PPI DB from {POOLED_PPI_DB} ...")
+pp = pooled_ppi.PooledPredictionsDb(POOLED_PPI_DB)
+print(f"  Memory after pandas load: {mem_gb():.1f} GB")
 
-    if PAIR_COL not in df.columns:
-        candidates = [c for c in df.columns if "complex_pair" in c.lower() or "pair" in c.lower()]
-        if candidates:
-            print(f"  Column '{PAIR_COL}' not found. Candidates with 'pair': {candidates}")
-        sys.exit(f"Column '{PAIR_COL}' not found in CSV.")
+pp_df = pl.from_pandas(pp.pairs)
+print(f"  DB shape: {pp_df.shape}")
+print(f"  Memory after pandas→polars: {mem_gb():.1f} GB")
 
-    df = df.with_row_index("row_id")
+# Free the pandas copy immediately
+del pp
+gc.collect()
+print(f"  Memory after freeing pandas: {mem_gb():.1f} GB")
 
-    print("Parsing target pairs ...")
-    pairs_df = (
-        df.select(["row_id", PAIR_COL])
-        .with_columns(
-            pl.col(PAIR_COL)
-            .map_elements(parse_pairs, return_dtype=pl.List(pl.List(pl.String)))
-            .alias("pairs")
-        )
-        .explode("pairs")
-        .drop_nulls("pairs")
-        .with_columns([
-            pl.col("pairs").list.get(0).alias("p1"),
-            pl.col("pairs").list.get(1).alias("p2"),
-        ])
-    )
+# Discover ipTM column
+iptm_col = None
+for candidate in [
+    "chain_pair_iptm_mean_corrected",
+    "chain_pair_iptm",
+    "iptm",
+    "ipTM",
+    "average_iptm",
+]:
+    if candidate in pp_df.columns:
+        iptm_col = candidate
+        break
 
-    unique_pairs = pairs_df.select(["p1", "p2"]).unique()
-    print(f"  Found {unique_pairs.height} unique pairs across {df.height} rows")
+if iptm_col is None:
+    iptm_candidates = [c for c in pp_df.columns if "iptm" in c.lower()]
+    if iptm_candidates:
+        iptm_col = iptm_candidates[0]
+    else:
+        sys.exit("Cannot find an ipTM column in the pooled-PPI DB.")
 
-    print(f"Loading pooled-PPI DB from {POOLED_PPI_DB} ...")
-    pp = pooled_ppi.PooledPredictionsDb(POOLED_PPI_DB)
-    
-    # Efficient conversion of internal DB pandas frame into Polars
-    pp_df = pl.from_pandas(pp.pairs)
-    print(f"  pp_df shape: {pp_df.shape}")
+print(f"  Using ipTM column: {iptm_col}")
 
-    # Dynamically discover ipTM target column
-    iptm_col = None
-    for candidate in [
-        "chain_pair_iptm_mean_corrected",
-        "chain_pair_iptm",
-        "iptm",
-        "ipTM",
-        "average_iptm",
-    ]:
-        if candidate in pp_df.columns:
-            iptm_col = candidate
-            break
-
-    if iptm_col is None:
-        iptm_candidates = [c for c in pp_df.columns if "iptm" in c.lower()]
-        if iptm_candidates:
-            iptm_col = iptm_candidates[0]
-        else:
-            sys.exit("Cannot proceed without an ipTM column.")
-
-    print(f"  Using ipTM column: {iptm_col}")
-
-    # Normalize DB layout horizontally (p1 <= p2) for infallible hashing
-    print("Normalizing DB structures and index matching...")
-    lookup_df = (
+# Normalize DB to canonical order (p1 <= p2) and take BEST (max) iptm per pair
+print("Normalizing DB and taking max iptm per pair ...")
+lookup_df = (
     pp_df.select(["uniprot_id1", "uniprot_id2", iptm_col])
     .with_columns([
         pl.min_horizontal("uniprot_id1", "uniprot_id2").alias("p1"),
@@ -126,48 +102,101 @@ def main():
     ])
     .select(["p1", "p2", iptm_col])
     .group_by(["p1", "p2"])
-    .agg(pl.col(iptm_col).max())  # <-- take best score, not first
-    )
+    .agg(pl.col(iptm_col).max().alias("best_iptm"))
+)
+print(f"  Lookup table: {lookup_df.height} unique pairs with best iptm")
 
-    # Fast hash-join mapping execution
-    lookup_results = unique_pairs.join(lookup_df, on=["p1", "p2"], how="left")
-    found_count = lookup_results.filter(pl.col(iptm_col).is_not_null()).height
-    missing_count = lookup_results.filter(pl.col(iptm_col).is_null()).height
-    print(f"  Looked up {unique_pairs.height} pairs: {found_count} found, {missing_count} missing.")
+# Free the raw polars DB copy — only keep the compact lookup table
+del pp_df
+gc.collect()
+print(f"  Memory after building lookup_df: {mem_gb():.1f} GB")
 
-    print("Mapping ipTM matrix keys back to root dataset rows ...")
-    joined_pairs = pairs_df.join(lookup_df, on=["p1", "p2"], how="left")
+# --- Load target pairs -----------------------------------------------------
+print(f"Reading target pairs from {PAIRS_PATH} ...")
+pairs_df = pl.read_parquet(PAIRS_PATH)
+print(f"  {pairs_df.height} rows, columns: {pairs_df.columns}")
+print(f"  Memory after loading pairs: {mem_gb():.1f} GB")
 
-    joined_pairs = joined_pairs.with_columns(
-        pl.col(iptm_col)
-        .map_elements(lambda x: f"{x:.4f}" if x is not None else "NaN", return_dtype=pl.String)
-        .alias("formatted_score")
-    )
-    joined_pairs = joined_pairs.with_columns(
-        pl.format("{}_{}:{}", pl.col("p1"), pl.col("p2"), pl.col("formatted_score")).alias("pair_score_str")
-    )
-
-    agg_df = joined_pairs.group_by("row_id").agg([
-        pl.col(iptm_col).max().alias("iptm"),
-        pl.col("pair_score_str").str.join(";").alias("iptm_all_pairs")  
+# Normalize target pairs to canonical order
+pairs_norm = (
+    pairs_df.with_columns([
+        pl.min_horizontal("protein_A", "protein_B").alias("p1"),
+        pl.max_horizontal("protein_A", "protein_B").alias("p2"),
     ])
+    .with_row_index("row_id")
+)
 
-    final_df = (
-        df.join(agg_df, on="row_id", how="left")
-        .with_columns(pl.col("iptm_all_pairs").fill_null(""))
-        .sort("row_id")
-        .drop("row_id")
+# --- Diagnostic: coverage check --------------------------------------------
+target_unique = pairs_norm.select(["p1", "p2"]).unique()
+db_unique = lookup_df.select(["p1", "p2"])
+
+target_set = set(zip(target_unique["p1"].to_list(), target_unique["p2"].to_list()))
+db_set = set(zip(db_unique["p1"].to_list(), db_unique["p2"].to_list()))
+overlap = target_set & db_set
+print(f"  Unique target pairs: {len(target_set)}")
+print(f"  Unique DB pairs:     {len(db_set)}")
+print(f"  Overlap (found):     {len(overlap)}")
+print(f"  Missing from DB:     {len(target_set) - len(overlap)}")
+
+del target_unique, db_unique, target_set, db_set, overlap
+gc.collect()
+
+# --- Clean up any leftover part files from a previous run ------------------
+for p in sorted(OUTPUT_DIR.glob(f"{PARTS_PREFIX}*.parquet")):
+    p.unlink()
+    print(f"  Removed old part: {p.name}")
+
+# --- Batch join — write each batch to its own file -------------------------
+print(f"Processing in batches of {BATCH_SIZE} ...")
+
+n_total = pairs_norm.height
+n_batches = (n_total + BATCH_SIZE - 1) // BATCH_SIZE
+part_paths = []
+
+for batch_idx in range(n_batches):
+    start = batch_idx * BATCH_SIZE
+    end = min(start + BATCH_SIZE, n_total)
+    batch = pairs_norm.slice(start, end - start)
+
+    # Join against lookup table
+    batch_result = (
+        batch.join(lookup_df, on=["p1", "p2"], how="left")
+        .select(["protein_A", "protein_B", "best_iptm"])
     )
 
-    n_with_iptm = final_df.filter(pl.col("iptm").is_not_null()).height
-    print(f"  {n_with_iptm}/{final_df.height} rows processed with matching metrics.")
+    # Write this batch to its own file — no accumulation in memory
+    part_path = OUTPUT_DIR / f"{PARTS_PREFIX}{batch_idx:04d}.parquet"
+    batch_result.write_parquet(part_path)
+    part_paths.append(part_path)
 
-    final_df.write_csv(OUTPUT_PATH)
-    print(f"\nSaved file output to: {OUTPUT_PATH}")
-    print(f"  Shape: {final_df.shape}")
+    found_in_batch = batch_result.filter(pl.col("best_iptm").is_not_null()).height
+    print(f"  Batch {batch_idx + 1}/{n_batches} (rows {start}-{end}): "
+          f"{found_in_batch}/{batch.height} pairs found, "
+          f"memory: {mem_gb():.1f} GB")
 
-if __name__ == "__main__":
-    main()
+    del batch, batch_result
+    gc.collect()
+
+# Free the input pairs — no longer needed
+del pairs_norm, pairs_df
+gc.collect()
+
+# --- Assemble final output from parts --------------------------------------
+print("Assembling final output from parts ...")
+final_df = pl.concat([pl.read_parquet(p) for p in part_paths])
+final_df.write_parquet(OUTPUT_PATH)
+
+n_found = final_df.filter(pl.col("best_iptm").is_not_null()).height
+n_missing = final_df.filter(pl.col("best_iptm").is_null()).height
+print(f"\nDone! {n_found}/{final_df.height} pairs have iptm scores, {n_missing} missing.")
+print(f"Final output: {OUTPUT_PATH}")
+print(f"  Shape: {final_df.shape}")
+print(f"  Peak memory: {mem_gb():.1f} GB")
+
+# Clean up part files
+for p in part_paths:
+    p.unlink()
+print("Part files removed.")
 EOF
 
 echo "[$(date)] Script run complete."
