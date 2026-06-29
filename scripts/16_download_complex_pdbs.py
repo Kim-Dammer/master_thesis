@@ -1,23 +1,30 @@
 #!/usr/bin/env python
 """
-15_download_complex_pdbs.py — Download PDB files cross-referenced from
+16_download_complex_pdbs.py — Download PDB files cross-referenced from
 Complex Portal for all yeast complexes.
 
-Reads Saccharomyces_cerevisiae_ComplexTab.tsv, extracts wwpdb cross-references
-tagged as (identity) or (subset), downloads the corresponding PDB files from
-RCSB, and organizes them into two folders:
-  identity/  — PDBs where the structure represents the complete complex
-  subset/    — PDBs where the complex is part of a larger assembly
+Reads Saccharomyces_cerevisiae_ComplexTab.tsv and extracts wwpdb references
+from TWO columns:
 
-Files are named: {CPX_ID}_{PDB_ID}.pdb  (e.g. CPX-21_6I52.pdb)
+  1. "Cross references" — tagged as (identity) or (subset)
+  2. "Experimental evidence" — untagged (just `wwpdb:XXXX`)
+
+Downloads each unique PDB once from RCSB, then organises per-CPX copies into
+three folders:
+
+  identity/                — PDB represents the complete complex
+  subset/                  — Complex is part of a larger PDB assembly
+  experimental_evidence/   — PDB cited as experimental evidence (untagged)
+
+Files are named:  {CPX_ID}_{PDB_ID}.pdb   (e.g. CPX-21_6I52.pdb)
 Already-existing files are skipped (resume-friendly).
 
 Usage:
-    python 15_download_complex_pdbs.py \
+    python 16_download_complex_pdbs.py \
         --tsv data/Complex_Portal/Saccharomyces_cerevisiae_ComplexTab.tsv \
         --out-dir data/Complex_pdb_files
 
-    # Or as an sbatch job (recommended for large downloads):
+    # Or as an sbatch job (recommended):
     sbatch scripts/15_download_complex_pdbs.sbatch
 """
 
@@ -36,19 +43,34 @@ from urllib.error import HTTPError, URLError
 # Config
 # ---------------------------------------------------------------------------
 RCSB_DOWNLOAD_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
-DOWNLOAD_DELAY_SEC = 0.3  # be nice to RCSB
+DOWNLOAD_DELAY_SEC = 0.3   # be nice to RCSB
 MAX_RETRIES = 3
 RETRY_DELAY_SEC = 5
 
+# Three tag categories — output folder names match exactly
+TAGS = ("identity", "subset", "experimental_evidence")
+
+# wwpdb tagged tokens: wwpdb:6I52(identity) | wwpdb:4M77(subset)
+WWPDB_TAGGED_RE = re.compile(r"^wwpdb:([A-Za-z0-9]{4})\((identity|subset)\)$")
+
+# wwpdb bare token (used in the "Experimental evidence" column): wwpdb:5VSU
+WWPDB_BARE_RE = re.compile(r"\bwwpdb:([A-Za-z0-9]{4})\b")
+
+# Any wwpdb: token — used only to spot malformed entries we ultimately drop
+WWPDB_ANY_RE = re.compile(r"^wwpdb:[^|]+$")
+
+
 # ---------------------------------------------------------------------------
-# Parse cross-references
+# Parsing
 # ---------------------------------------------------------------------------
 
-def parse_pdb_xrefs(cross_ref_str: str) -> dict[str, list[str]]:
+def parse_pdb_xrefs(cross_ref_str: str, malformed_log: list[tuple[str, str]] | None = None,
+                    cpx_id_for_log: str = "") -> dict[str, list[str]]:
     """Parse the 'Cross references' column for wwpdb entries.
 
     Returns {"identity": [pdb_id, ...], "subset": [pdb_id, ...]}.
-    Untagged wwpdb entries are ignored.
+    Malformed wwpdb tokens (e.g. PubMed IDs misfiled as wwpdb) are recorded
+    in malformed_log if provided.
     """
     result: dict[str, list[str]] = {"identity": [], "subset": []}
     if not isinstance(cross_ref_str, str) or not cross_ref_str:
@@ -56,15 +78,36 @@ def parse_pdb_xrefs(cross_ref_str: str) -> dict[str, list[str]]:
 
     for token in cross_ref_str.split("|"):
         token = token.strip()
-        # Match patterns like: wwpdb:6I52(identity) or wwpdb:4M77(subset)
-        m = re.match(r"^wwpdb:([A-Za-z0-9]{4})\((identity|subset)\)$", token)
+        m = WWPDB_TAGGED_RE.match(token)
         if m:
             pdb_id = m.group(1).upper()
             tag = m.group(2)
             if pdb_id not in result[tag]:
                 result[tag].append(pdb_id)
+        elif WWPDB_ANY_RE.match(token):
+            # Looks like a wwpdb entry but doesn't match expected format
+            # (e.g. CPX-1316: wwpdb:35022249(identity) — a PubMed ID misfile)
+            if malformed_log is not None:
+                malformed_log.append((cpx_id_for_log, token))
 
     return result
+
+
+def parse_experimental_evidence(exp_evidence_str: str) -> list[str]:
+    """Parse the 'Experimental evidence' column for untagged wwpdb entries.
+
+    Returns a list of uppercase PDB IDs found. Uses a word-boundary regex so
+    `wwpdb:5VSU` is captured even when surrounded by other tokens separated
+    by `|`, `,`, `;`, or whitespace.
+    """
+    if not isinstance(exp_evidence_str, str) or not exp_evidence_str:
+        return []
+    pdbs: list[str] = []
+    for match in WWPDB_BARE_RE.finditer(exp_evidence_str):
+        pdb_id = match.group(1).upper()
+        if pdb_id not in pdbs:
+            pdbs.append(pdb_id)
+    return pdbs
 
 
 # ---------------------------------------------------------------------------
@@ -107,29 +150,31 @@ def download_pdb(pdb_id: str, dest_path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tsv", required=True, type=Path,
                     help="Path to Saccharomyces_cerevisiae_ComplexTab.tsv")
     ap.add_argument("--out-dir", required=True, type=Path,
-                    help="Output directory (will contain identity/ and subset/ subdirs)")
+                    help="Output directory (will contain identity/, subset/, experimental_evidence/, _raw/)")
     ap.add_argument("--delay", type=float, default=DOWNLOAD_DELAY_SEC,
                     help=f"Seconds between downloads (default: {DOWNLOAD_DELAY_SEC})")
     ap.add_argument("--dry-run", action="store_true",
-                    help="Parse and print what would be downloaded, but don't download")
+                    help="Parse and report what would be downloaded; do not download.")
     args = ap.parse_args()
 
     if not args.tsv.exists():
         sys.exit(f"TSV not found: {args.tsv}")
 
-    # Create output directories
-    identity_dir = args.out_dir / "identity"
-    subset_dir = args.out_dir / "subset"
-    identity_dir.mkdir(parents=True, exist_ok=True)
-    subset_dir.mkdir(parents=True, exist_ok=True)
+    # --- Create output directories ---
+    tag_dirs: dict[str, Path] = {tag: args.out_dir / tag for tag in TAGS}
+    raw_dir = args.out_dir / "_raw"
+    for d in (*tag_dirs.values(), raw_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
     # --- Parse TSV ---
     print(f"Reading {args.tsv}")
-    cpx_to_pdbs: dict[str, dict[str, list[str]]] = {}  # cpx_id -> {"identity": [...], "subset": [...]}
+    cpx_to_pdbs: dict[str, dict[str, list[str]]] = {}   # cpx_id -> {tag: [pdb_id, ...]}
+    malformed_log: list[tuple[str, str]] = []
 
     with open(args.tsv, newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
@@ -137,121 +182,140 @@ def main():
             cpx_id = row.get("#Complex ac", "").strip()
             if not cpx_id:
                 continue
+
+            # 1. Tagged wwpdb entries in 'Cross references'
             xref_str = row.get("Cross references", "")
-            pdbs = parse_pdb_xrefs(xref_str)
-            if pdbs["identity"] or pdbs["subset"]:
-                cpx_to_pdbs[cpx_id] = pdbs
+            xref_pdbs = parse_pdb_xrefs(xref_str, malformed_log, cpx_id)
 
-    # --- Summary ---
-    all_identity = set()
-    all_subset = set()
-    for pdbs in cpx_to_pdbs.values():
-        all_identity.update(pdbs["identity"])
-        all_subset.update(pdbs["subset"])
+            # 2. Untagged wwpdb entries in 'Experimental evidence'
+            exp_str = row.get("Experimental evidence", "")
+            exp_pdbs = parse_experimental_evidence(exp_str)
 
-    print(f"Found {len(cpx_to_pdbs)} complexes with PDB cross-references")
-    print(f"  Identity PDBs: {len(all_identity)} unique")
-    print(f"  Subset PDBs:   {len(all_subset)} unique")
-    overlap = all_identity & all_subset
-    if overlap:
-        print(f"  (Overlap: {len(overlap)} PDBs appear as both identity and subset across complexes)")
+            # Deduplicate exp_pdbs against tagged xref_pdbs (don't double-tag the same PDB)
+            tagged_pdbs = set(xref_pdbs["identity"]) | set(xref_pdbs["subset"])
+            exp_pdbs_unique = [p for p in exp_pdbs if p not in tagged_pdbs]
 
-    # --- Download ---
-    total_downloads = len(all_identity) + len(all_subset)
+            entry: dict[str, list[str]] = {
+                "identity": list(xref_pdbs["identity"]),
+                "subset": list(xref_pdbs["subset"]),
+                "experimental_evidence": exp_pdbs_unique,
+            }
+
+            if any(entry[tag] for tag in TAGS):
+                cpx_to_pdbs[cpx_id] = entry
+
+    # --- Log malformed entries ---
+    if malformed_log:
+        print(f"\n[SKIP_MALFORMED] Dropped {len(malformed_log)} wwpdb token(s) that don't look like 4-char PDB IDs:")
+        for cpx_id, tok in malformed_log:
+            print(f"  {cpx_id}: {tok}")
+
+    # --- Coverage summary ---
+    counts: dict[str, set[tuple[str, str]]] = {tag: set() for tag in TAGS}
+    unique_pdbs_per_tag: dict[str, set[str]] = {tag: set() for tag in TAGS}
+    for cpx, pdbs in cpx_to_pdbs.items():
+        for tag in TAGS:
+            for pdb_id in pdbs[tag]:
+                counts[tag].add((cpx, pdb_id))
+                unique_pdbs_per_tag[tag].add(pdb_id)
+
+    all_pdbs: set[str] = set().union(*unique_pdbs_per_tag.values())
+
+    print(f"\nFound {len(cpx_to_pdbs)} complexes with PDB cross-references.")
+    for tag in TAGS:
+        print(f"  {tag:24s}  {len(counts[tag]):4d} (CPX, PDB) pairs, "
+              f"{len(unique_pdbs_per_tag[tag]):4d} unique PDB IDs")
+    print(f"  {'TOTAL UNIQUE PDB IDs':24s}  {len(all_pdbs):4d}")
+
+    # --- Build pdb_to_cpxs (each unique PDB -> which CPXs/tags reference it) ---
+    pdb_to_cpxs: dict[str, dict[str, list[str]]] = {}
+    for cpx, pdbs in cpx_to_pdbs.items():
+        for tag in TAGS:
+            for pdb_id in pdbs[tag]:
+                pdb_to_cpxs.setdefault(pdb_id, {t: [] for t in TAGS})
+                if cpx not in pdb_to_cpxs[pdb_id][tag]:
+                    pdb_to_cpxs[pdb_id][tag].append(cpx)
+
+    # --- Download each unique PDB once ---
     downloaded = 0
     skipped_existing = 0
     failed = 0
 
-    # Collect all (pdb_id, tag, cpx_ids) tuples
-    # A single PDB can be referenced by multiple CPX IDs — download once, symlink or copy
-    # We'll download once and then create copies named per-CPX
-    pdb_to_cpxs: dict[str, dict[str, list[str]]] = {}  # pdb_id -> {"identity": [cpx, ...], "subset": [cpx, ...]}
-    for cpx_id, pdbs in cpx_to_pdbs.items():
-        for pdb_id in pdbs["identity"]:
-            pdb_to_cpxs.setdefault(pdb_id, {"identity": [], "subset": []})
-            if cpx_id not in pdb_to_cpxs[pdb_id]["identity"]:
-                pdb_to_cpxs[pdb_id]["identity"].append(cpx_id)
-        for pdb_id in pdbs["subset"]:
-            pdb_to_cpxs.setdefault(pdb_id, {"identity": [], "subset": []})
-            if cpx_id not in pdb_to_cpxs[pdb_id]["subset"]:
-                pdb_to_cpxs[pdb_id]["subset"].append(cpx_id)
+    print(f"\nDownloading {len(pdb_to_cpxs)} unique PDB files into {raw_dir}...")
 
-    # Download each unique PDB once, then copy to per-CPX names
-    # First pass: download raw PDB files to a temp location
-    raw_dir = args.out_dir / "_raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"\nDownloading {len(pdb_to_cpxs)} unique PDB files...")
-
-    for i, (pdb_id, tags) in enumerate(sorted(pdb_to_cpxs.items()), start=1):
+    for i, (pdb_id, tags_for_pdb) in enumerate(sorted(pdb_to_cpxs.items()), start=1):
         raw_path = raw_dir / f"{pdb_id}.pdb"
 
-        # Skip if already downloaded
         if raw_path.exists() and raw_path.stat().st_size > 0:
             skipped_existing += 1
+            continue
+
+        if args.dry_run:
+            print(f"  [{i}/{len(pdb_to_cpxs)}] Would download {pdb_id}")
+            continue
+
+        print(f"  [{i}/{len(pdb_to_cpxs)}] Downloading {pdb_id}...", end=" ", flush=True)
+        if download_pdb(pdb_id, raw_path):
+            downloaded += 1
+            print("OK")
         else:
-            if args.dry_run:
-                print(f"  [{i}/{len(pdb_to_cpxs)}] Would download {pdb_id}")
-                continue
-            print(f"  [{i}/{len(pdb_to_cpxs)}] Downloading {pdb_id}...", end=" ", flush=True)
-            success = download_pdb(pdb_id, raw_path)
-            if success:
-                downloaded += 1
-                print("OK")
-            else:
-                failed += 1
-                continue
-            time.sleep(args.delay)
+            failed += 1
+            continue
+        time.sleep(args.delay)
 
     if args.dry_run:
-        print(f"\n[DRY-RUN] Would download {len(pdb_to_cpxs)} PDB files")
-        print(f"  Identity: {len(all_identity)}, Subset: {len(all_subset)}")
+        print(f"\n[DRY-RUN] Would download {len(pdb_to_cpxs)} unique PDB files.")
+        # Still write the mapping CSV so the user can inspect the planned coverage
+        _write_mapping_csv(args.out_dir, cpx_to_pdbs)
         return
 
-    # Second pass: create per-CPX copies in identity/ and subset/ folders
-    print(f"\nOrganizing files into identity/ and subset/...")
+    # --- Organise per-CPX copies into identity/, subset/, experimental_evidence/ ---
+    print(f"\nOrganising files into identity/, subset/, experimental_evidence/...")
+    copied_counts: dict[str, int] = {tag: 0 for tag in TAGS}
 
-    for pdb_id, tags in sorted(pdb_to_cpxs.items()):
+    for pdb_id, tags_for_pdb in sorted(pdb_to_cpxs.items()):
         raw_path = raw_dir / f"{pdb_id}.pdb"
         if not raw_path.exists():
             continue
 
-        for cpx_id in tags["identity"]:
-            dest = identity_dir / f"{cpx_id}_{pdb_id}.pdb"
-            if not dest.exists():
-                dest.write_bytes(raw_path.read_bytes())
-
-        for cpx_id in tags["subset"]:
-            dest = subset_dir / f"{cpx_id}_{pdb_id}.pdb"
-            if not dest.exists():
-                dest.write_bytes(raw_path.read_bytes())
+        for tag in TAGS:
+            for cpx in tags_for_pdb[tag]:
+                dest = tag_dirs[tag] / f"{cpx}_{pdb_id}.pdb"
+                if not dest.exists():
+                    dest.write_bytes(raw_path.read_bytes())
+                    copied_counts[tag] += 1
 
     # --- Write mapping CSV ---
-    mapping_path = args.out_dir / "complex_pdb_mapping.csv"
+    mapping_path = _write_mapping_csv(args.out_dir, cpx_to_pdbs)
+
+    # --- Final summary ---
+    print(f"\nDone.")
+    print(f"  Downloaded:        {downloaded}")
+    print(f"  Skipped existing:  {skipped_existing}")
+    print(f"  Failed:            {failed}")
+    for tag in TAGS:
+        n_files = len(list(tag_dirs[tag].glob("*.pdb")))
+        print(f"  {tag}/ files: {n_files} (copied this run: {copied_counts[tag]})")
+    print(f"  Mapping CSV:       {mapping_path}")
+    print(f"\nOutput structure:")
+    print(f"  {args.out_dir}/")
+    print(f"    identity/                — PDB represents complete complex")
+    print(f"    subset/                  — Complex is part of larger PDB assembly")
+    print(f"    experimental_evidence/   — PDB cited as evidence (untagged in TSV)")
+    print(f"    _raw/                    — Unique downloads (one per PDB ID)")
+    print(f"    complex_pdb_mapping.csv  — Per-(CPX, PDB, tag) row")
+
+
+def _write_mapping_csv(out_dir: Path, cpx_to_pdbs: dict[str, dict[str, list[str]]]) -> Path:
+    mapping_path = out_dir / "complex_pdb_mapping.csv"
     with open(mapping_path, "w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(["#Complex ac", "pdb_id", "tag"])
-        for cpx_id, pdbs in sorted(cpx_to_pdbs.items()):
-            for pdb_id in pdbs["identity"]:
-                writer.writerow([cpx_id, pdb_id, "identity"])
-            for pdb_id in pdbs["subset"]:
-                writer.writerow([cpx_id, pdb_id, "subset"])
-
-    # --- Final summary ---
-    n_identity_files = len(list(identity_dir.glob("*.pdb")))
-    n_subset_files = len(list(subset_dir.glob("*.pdb")))
-
-    print(f"\nDone!")
-    print(f"  Downloaded: {downloaded}, Skipped (existing): {skipped_existing}, Failed: {failed}")
-    print(f"  identity/ files: {n_identity_files}")
-    print(f"  subset/   files: {n_subset_files}")
-    print(f"  Mapping CSV: {mapping_path}")
-    print(f"\nOutput structure:")
-    print(f"  {args.out_dir}/")
-    print(f"    identity/   — PDBs where structure = complete complex")
-    print(f"    subset/     — PDBs where complex is part of larger assembly")
-    print(f"    _raw/       — Raw downloaded files (one per unique PDB ID)")
-    print(f"    complex_pdb_mapping.csv")
+        for cpx in sorted(cpx_to_pdbs.keys()):
+            for tag in TAGS:
+                for pdb_id in cpx_to_pdbs[cpx][tag]:
+                    writer.writerow([cpx, pdb_id, tag])
+    return mapping_path
 
 
 if __name__ == "__main__":
