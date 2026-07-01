@@ -10,11 +10,13 @@ dependencies = [
     "ipykernel>=7.2.0",
     "lxml>=6.1.0",
     "marimo>=0.23.5",
+    "nglview>=4.0.1",
     "pandas>=3.0.3",
     "polars>=1.40.1",
     "pooled-ppi",
     "py3dmol>=2.5.4",
     "pyarrow>=24.0.0",
+    "pymol-open-source>=3.1.0a0",
     "python-dotenv>=1.2.2",
     "stoic",
 ]
