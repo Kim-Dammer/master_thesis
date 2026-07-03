@@ -9,7 +9,7 @@
 #SBATCH --mem-per-cpu=2G
 
 # ===========================================================================
-# Download PDB files cross-referenced from Complex Portal for all yeast
+# Downloads ONLY PDB files cross-referenced from Complex Portal for all yeast
 # complexes. Produces three subfolders:
 #   identity/                 — PDB represents the complete complex
 #   subset/                   — Complex is part of a larger PDB assembly

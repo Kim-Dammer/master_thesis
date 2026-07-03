@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-17_map_uniprot_pdb_complex.py — Map Complex Portal yeast complexes to PDB
+20_map_uniprot_pdb_complex.py — Map Complex Portal yeast complexes to PDB
 structures via EBI SIFTS, producing two dataframes.
 
 DF1 uniprot_pdb_mapping.csv  — one row per (UniProt, PDB, chain) from SIFTS.
@@ -13,12 +13,12 @@ groups like [P0CX46,P0CX45] are expanded. PRO_ isoforms (P00410-PRO_xxx)
 are reduced to their base UniProt.
 
 Usage:
-    python 17_map_uniprot_pdb_complex.py \
+    python 20_map_uniprot_pdb_complex.py \
         --tsv  data/Complex_Portal/Saccharomyces_cerevisiae_ComplexTab.tsv \
         --out-dir data/Complex_pdb_files/uniprot_pdb
 
     # audit-only (no SIFTS calls):
-    python 17_map_uniprot_pdb_complex.py --tsv ... --out-dir ... --dry-run
+    python 20_map_uniprot_pdb_complex.py --tsv ... --out-dir ... --dry-run
 
 Resume: sifts_cache.json in out-dir stores all SIFTS responses.
 """
