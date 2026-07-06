@@ -1,16 +1,11 @@
 #!/usr/bin/env python
 """
-
-
 lookup_iptm.py — Look up ipTM scores for all pairs in the yeastmap CSV.
 
 Reads the CSV with a 'complex:complex_pairs' column (entries like "P25554-P38811"),
 looks up ipTM from the pooled-PPI database, adds an 'iptm' column, and saves
 the result as iptm_scores.csv.
 
-Usage (on cluster login node):
-    source /cluster/project/beltrao/kdammer/master_thesis/.venv/bin/activate
-    python lookup_iptm.py
 """
 
 from pathlib import Path
