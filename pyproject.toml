@@ -7,6 +7,7 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
     "af3io>=26.0",
     "fastparquet>=2026.5.0",
+    "hmmer>=3.4.0.2",
     "ipykernel>=7.2.0",
     "lxml>=6.1.0",
     "marimo>=0.23.5",

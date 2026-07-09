@@ -5,6 +5,8 @@ coverage, length-weighted overall coverage, best biological assembly, and
 resolution. No PDB files are downloaded in this script
 
 Does not yet deal well with paralogues (requires both for perfect macth with the same stoichiometry as one of them would have)
+Coverage calcualtion is not correct yet, instead of https://www.ebi.ac.uk/pdbe/api/mappings/best_structures/P14284, it would need to get coverage from 
+https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/6PSX
 Fully self-contained: queries SIFTS, UniProt, and RCSB assembly APIs itself
 and keeps all caches inside the output folder.
 

@@ -1053,6 +1053,26 @@ wheels = [
 ]
 
 [[package]]
+name = "hmmer"
+version = "3.4.0.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/89/f6/5b484de83d732602bbb940b0887526ae753e1e76e8557e8a96cc6fdf2436/hmmer-3.4.0.2.tar.gz", hash = "sha256:7aad5945b44fa575192ce5624bef80f1dece11f9520eabcf7d4d4d18f437d8bf", size = 3447, upload-time = "2024-12-03T12:20:51.187Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/16/e7f74c29e6333e589304b907d86066fd4ebab6449224e7ed6d6cdc0d358f/hmmer-3.4.0.2-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:9e4deee37678849d51e8c319a1b11c4a9b8768818a98ac673174c04188f362c4", size = 6860488, upload-time = "2024-12-03T15:49:59.585Z" },
+    { url = "https://files.pythonhosted.org/packages/70/7d/d2ed1234d423cf1cca0a245fa05630d65664bf535dea5261da753a53077a/hmmer-3.4.0.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:76a988a76928fdc98def0ef249e3e26fbdbfdb2b95d3d27ac331b8afe60b2cf8", size = 6255476, upload-time = "2024-12-03T15:50:01.047Z" },
+    { url = "https://files.pythonhosted.org/packages/99/00/330a632f80e057c9c5d7ee2a581d642f0245c318f3408475e490821219d8/hmmer-3.4.0.2-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:bbe2bf53bb4fa1184afe57ae82ed8e39b24feaae93aec94adf82311a33129c98", size = 7435676, upload-time = "2024-12-03T15:50:03.083Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/e5/6cd13d45959578a3c419a732adcdb94856180439cb893b9625b9f51b8249/hmmer-3.4.0.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:84625b54950b0c9c8403af2415db70ec23f96346637a91b2f3a132c160f2c4ee", size = 7053676, upload-time = "2024-12-03T15:50:04.807Z" },
+    { url = "https://files.pythonhosted.org/packages/66/c2/2e13991d5c7f64d800462288de95bde2805f0bd3ac6c27d1488f168be3ce/hmmer-3.4.0.2-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:47a4a377dadd1069457fddd09f11dcf69dd52f3ed54476ec58cb574ed6a72330", size = 7755315, upload-time = "2024-12-03T15:50:06.41Z" },
+    { url = "https://files.pythonhosted.org/packages/38/48/b7b11a634023c98fc86bd10a79035d5db09bb001f8d952eb644550f8f10b/hmmer-3.4.0.2-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:6772250b3b16c9b6ea6218d7aeed3afece5d2078dd497a1360066c08ac85aeaa", size = 7562400, upload-time = "2024-12-03T15:50:08.217Z" },
+    { url = "https://files.pythonhosted.org/packages/ac/4e/831f1f20fa42f39a727865b6e12222d0c344f4f86a31ead17dce20229ad6/hmmer-3.4.0.2-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:215c985750d62b97be5d55ccc32df8d6c9fef942f6807c596aa9e493a6ea0259", size = 6872895, upload-time = "2024-12-03T15:50:09.686Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/82/93401eb980d9a944d05df7db24a449754ed52f446244db6e3b2f37595879/hmmer-3.4.0.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:31d00d0ed4b4984c966a4fdfde0f42839d1d60148fe44b02ce1b51ab03518c6d", size = 6255477, upload-time = "2024-12-03T15:50:11.046Z" },
+    { url = "https://files.pythonhosted.org/packages/05/19/d55129ea2053935633327d80794084856e0a9c41100c5fa8e99e149f07b0/hmmer-3.4.0.2-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:5d616ab758abbc612773c885c77a219ae3e4cef7b805c9f44a6d3d39d23bb5f1", size = 7435676, upload-time = "2024-12-03T15:50:12.447Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/08/5afdf72e0afb17f118eb3ab84d6c0888f2516b550be9ab638b2da74d07b3/hmmer-3.4.0.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:8b53b2e19039a0834dfab961141c7d757e59b1d2b5082d6bbcebe3a1edbd247c", size = 7053676, upload-time = "2024-12-03T15:50:14.103Z" },
+    { url = "https://files.pythonhosted.org/packages/29/70/bda6d8e9d33f83ed409345439e159172251876b454c0b442252d09d48bcc/hmmer-3.4.0.2-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:574d41b15714ca9dd026abfaa8a8395f6eb032df0aa5cc07199f77eec90e9b91", size = 7755317, upload-time = "2024-12-03T15:50:15.563Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/cf/9f9ff402c4b80736dc05333f0eef45313e452b16dcff520ebef8cce93864/hmmer-3.4.0.2-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:1d56c8184034dfac06673287ccde8d75a23772974e43e24220f2ad5ff4b5de51", size = 7562399, upload-time = "2024-12-03T15:50:17.039Z" },
+]
+
+[[package]]
 name = "httpcore"
 version = "1.0.9"
 source = { registry = "https://pypi.org/simple" }
@@ -2453,6 +2473,7 @@ source = { editable = "." }
 dependencies = [
     { name = "af3io" },
     { name = "fastparquet" },
+    { name = "hmmer" },
     { name = "ipykernel" },
     { name = "lxml" },
     { name = "marimo" },
@@ -2477,6 +2498,7 @@ dev = [
 requires-dist = [
     { name = "af3io", specifier = ">=26.0" },
     { name = "fastparquet", specifier = ">=2026.5.0" },
+    { name = "hmmer", specifier = ">=3.4.0.2" },
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "lxml", specifier = ">=6.1.0" },
     { name = "marimo", specifier = ">=0.23.5" },
