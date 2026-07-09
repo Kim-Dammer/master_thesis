@@ -7,6 +7,9 @@ notebooks/complex-assembly/**
 scripts/complex-assembly/**
 scripts/logs/**
 Stoic/** 
+scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/data
+scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/slurm_logs
+scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/test_chunk_analysis_results
 
 .hf_cache/**
 

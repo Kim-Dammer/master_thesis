@@ -12,16 +12,16 @@
 # --- USER CONFIGURATION ---
 #INPUT_DATA_DIR="/cluster/project/beltrao/JvG/Projects/ubn_conf_changes/ubn_conf_changes/output/data/postAF3/uniqSeqs"
 #OUTPUT_RESULTS_DIR="$SLURM_SUBMIT_DIR/chunk_analysis_results/uniqSeqsRes"
-INPUT_DATA_DIR="/cluster/project/beltrao/JvG/Projects/ubn_conf_changes/ubn_conf_changes/output/data/postAF3/uniqSeqs_test"
-OUTPUT_RESULTS_DIR="$SLURM_SUBMIT_DIR/chunk_analysis_results/uniqSeqs_test"
+INPUT_DATA_DIR="/cluster/project/beltrao/kdammer/master_thesis/scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/data"
+OUTPUT_RESULTS_DIR="$SLURM_SUBMIT_DIR/chunk_analysis_results/uniqSeqs"
 CHUNK_SIZE=1
 
 # --- CONTAINER AND SCRIPT CONFIGURATION ---
 AF3_IMAGE="/cluster/project/beltrao/shared/alphafold3/images/alphafold3_2e2ffc1.sif"
-PROJECT_DIR="/cluster/project/beltrao/JvG"
+PROJECT_DIR="/cluster/project/beltrao/kdammer"
 DATABASE_DIR="/cluster/project/alphafold"
 PYTHON_SCRIPT="$SLURM_SUBMIT_DIR/scripts/run_chunk_analysis.py"
-TRUE_IDENTITY_SCRIPT="$SLURM_SUBMIT_DIR/scripts/calculate_true_identity.py"
+#TRUE_IDENTITY_SCRIPT="$SLURM_SUBMIT_DIR/scripts/calculate_true_identity.py"
 PDB_SEQRES_PATH="/cluster/project/alphafold/pdb_seqres/pdb_seqres.txt"
 
 # --- SCRIPT LOGIC ---
@@ -67,14 +67,19 @@ if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
     NUM_JOBS=$(( (TOTAL_FILES + CHUNK_SIZE - 1) / CHUNK_SIZE ))
     echo "Found $TOTAL_FILES new proteins to process. Submitting a job array with $NUM_JOBS tasks."
 
-    export FILES_TO_PROCESS="${UNPROCESSED_FILES[*]}"
+# Write the file list to a manifest file instead of an env var -
+    # exporting thousands of paths as one env var blows past the OS
+    # ARG_MAX limit ("Argument list too long") when sbatch is invoked.
+    MANIFEST_FILE="$SLURM_LOG_DIR/file_manifest_$$.txt"
+    printf '%s\n' "${UNPROCESSED_FILES[@]}" > "$MANIFEST_FILE"
+    export MANIFEST_FILE
 
     # Submit array job and capture its job ID
     ARRAY_JOB_ID=$(sbatch --parsable --array=1-$NUM_JOBS \
            --output="$SLURM_LOG_DIR/%A_%a.out" \
            --error="$SLURM_LOG_DIR/%A_%a.err" \
+           --export=ALL,MANIFEST_FILE="$MANIFEST_FILE" \
            "$0")
-
     echo "Array job $ARRAY_JOB_ID submitted."
 
     # DO THIS BY RUNNING THE SCRIPT INSTEAD

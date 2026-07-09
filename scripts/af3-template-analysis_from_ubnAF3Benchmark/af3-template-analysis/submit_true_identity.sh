@@ -13,7 +13,7 @@
 RESULTS_DIR="$SLURM_SUBMIT_DIR/chunk_analysis_results/uniqSeqsRes"
 
 # --- SCRIPT CONFIGURATION ---
-PROJECT_DIR="/cluster/project/beltrao/JvG"
+#PROJECT_DIR="/cluster/project/beltrao/JvG"
 DATABASE_DIR="/cluster/project/alphafold"
 PYTHON_SCRIPT="$SLURM_SUBMIT_DIR/scripts/run_single_true_identity.py"
 PDB_SEQRES_PATH="/cluster/project/alphafold/pdb_seqres/pdb_seqres.txt"
