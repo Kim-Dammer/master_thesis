@@ -4,11 +4,12 @@
 #SBATCH --job-name=lookup_plddt_pairs
 #SBATCH --output=logs/lookup_plddt_pairs_%j.out
 #SBATCH --error=logs/lookup_plddt_pairs_%j.err
-#SBATCH --time=24:00:00
-#SBATCH --cpus-per-task=4
+#SBATCH --time=1:00:00
+#SBATCH --cpus-per-task=3
 #SBATCH --mem-per-cpu=100G
 
 # ===========================================================================
+# gets sa
 # lookup_plddt_pairs.sh — Per-protein pLDDT + length, joined to pairs.
 #
 # For each unique protein in the input pairs:
@@ -43,7 +44,7 @@ import pooled_ppi
 # --- Paths -----------------------------------------------------------------
 POOLED_PPI_DB = "/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.04"
 PAIRS_PATH = Path("/cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/Ym_and_complex_used_pairs.csv") #contains only pairs from complexes of yeastmap and complex, not all possible pairs
-OUTPUT_PATH = Path("/cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/Ym_and_complex_used_pairs_plddt.parquet")
+OUTPUT_PATH = Path("/cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/Ym_and_complex_used_pairs_plddt_corr.parquet")
 OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 FC_DB = os.path.join(POOLED_PPI_DB, "predictions-db/predictions-db")
@@ -246,7 +247,8 @@ result_df = (
         how="left",
     )
     .with_columns(
-        ((pl.col("plddt1") + pl.col("plddt2")) / 2).alias("mean_plddt_pair")
+        ((pl.col("plddt1") + pl.col("plddt2")) / 2).alias("mean_plddt_pair"),
+        ((pl.col("plddt1") * pl.col("len1") + pl.col("plddt2") * pl.col("len2")) / (pl.col("len1") + pl.col("len2"))).alias("mean_weighted_plddt_pair")
     )
 )
 
