@@ -5,7 +5,7 @@
 
 # --- Slurm Settings ---
 #SBATCH --job-name=template_analysis
-#SBATCH --time=08:00:00
+#SBATCH --time=48:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=8G
 
@@ -67,7 +67,7 @@ if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
     NUM_JOBS=$(( (TOTAL_FILES + CHUNK_SIZE - 1) / CHUNK_SIZE ))
     echo "Found $TOTAL_FILES new proteins to process. Submitting a job array with $NUM_JOBS tasks."
 
-# Write the file list to a manifest file instead of an env var -
+    # Write the file list to a manifest file instead of an env var -
     # exporting thousands of paths as one env var blows past the OS
     # ARG_MAX limit ("Argument list too long") when sbatch is invoked.
     MANIFEST_FILE="$SLURM_LOG_DIR/file_manifest_$$.txt"
@@ -80,6 +80,7 @@ if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
            --error="$SLURM_LOG_DIR/%A_%a.err" \
            --export=ALL,MANIFEST_FILE="$MANIFEST_FILE" \
            "$0")
+
     echo "Array job $ARRAY_JOB_ID submitted."
 
     # DO THIS BY RUNNING THE SCRIPT INSTEAD
@@ -108,7 +109,7 @@ fi
 # This part now receives the list of unprocessed files from the master job.
 
 # Read the exported list of files into a Bash array
-read -r -a UNPROCESSED_FILES <<< "$FILES_TO_PROCESS"
+mapfile -t UNPROCESSED_FILES < "$MANIFEST_FILE"
 
 TASK_ID=$SLURM_ARRAY_TASK_ID
 START_INDEX=$(( (TASK_ID - 1) * CHUNK_SIZE ))
