@@ -5,22 +5,21 @@
 
 # --- Slurm Settings ---
 #SBATCH --job-name=true_identity
-#SBATCH --time=24:00:00
+#SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=4G
 
 # --- USER CONFIGURATION ---
-RESULTS_DIR="$SLURM_SUBMIT_DIR/chunk_analysis_results/uniqSeqsRes"
+RESULTS_DIR="$SLURM_SUBMIT_DIR/chunk_analysis_results/uniqSeqs"
 
 # --- SCRIPT CONFIGURATION ---
-#PROJECT_DIR="/cluster/project/beltrao/JvG"
+PROJECT_DIR="/cluster/project/beltrao/JvG"
 DATABASE_DIR="/cluster/project/alphafold"
 PYTHON_SCRIPT="$SLURM_SUBMIT_DIR/scripts/run_single_true_identity.py"
 PDB_SEQRES_PATH="/cluster/project/alphafold/pdb_seqres/pdb_seqres.txt"
 
-# Conda config
-CONDA_SH="/cluster/project/beltrao/JvG/software/miniforge3/etc/profile.d/conda.sh"
-CONDA_ENV="generalProtEnv"
+# Venv config (uv-managed)
+VENV_ACTIVATE="/cluster/project/beltrao/kdammer/master_thesis/.venv/bin/activate"
 
 # --- SCRIPT LOGIC ---
 
@@ -118,33 +117,30 @@ echo "--- Starting True Identity Task ${TASK_ID} ---"
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Processing folder: $(basename "$PROTEIN_FOLDER")"
 
-# --- MVP conda + biopython check (logs to Slurm output) ---
-echo "=== ENV CHECK (conda + biopython) ==="
+# --- MVP venv + biopython check (logs to Slurm output) ---
+echo "=== ENV CHECK (venv + biopython) ==="
 echo "Host: $(hostname)  Job: $SLURM_JOB_ID  Task: $SLURM_ARRAY_TASK_ID  Time: $(date)"
 
-source "$CONDA_SH"
-conda activate "$CONDA_ENV"
+source "$VENV_ACTIVATE"
 ACT_RC=$?
 
-echo "conda activate rc=$ACT_RC"
-echo "CONDA_DEFAULT_ENV=$CONDA_DEFAULT_ENV"
-echo "CONDA_PREFIX=$CONDA_PREFIX"
+echo "venv activate rc=$ACT_RC"
+echo "VIRTUAL_ENV=$VIRTUAL_ENV"
 echo "which python=$(which python 2>/dev/null || echo 'NOT FOUND')"
-echo "conda python=$CONDA_PREFIX/bin/python"
-"$CONDA_PREFIX/bin/python" -V 2>&1
+python -V 2>&1
 
-"$CONDA_PREFIX/bin/python" -c "import Bio; print('Biopython OK:', Bio.__version__)"
+python -c "import Bio; print('Biopython OK:', Bio.__version__)"
 RC=$?
 
 if [ $ACT_RC -ne 0 ] || [ $RC -ne 0 ]; then
-    echo "ERROR: Conda/Biopython check failed (activate rc=$ACT_RC, import rc=$RC)"
+    echo "ERROR: Venv/Biopython check failed (activate rc=$ACT_RC, import rc=$RC)"
     exit 2
 fi
 echo "=== ENV CHECK PASSED ==="
 # --- end check ---
 
-# Run python directly (NO singularity) using the conda env python explicitly
-"$CONDA_PREFIX/bin/python" "${PYTHON_SCRIPT}" \
+# Run python directly (NO singularity) using the activated venv's python
+python "${PYTHON_SCRIPT}" \
     --protein_folder "${PROTEIN_FOLDER}" \
     --pdb_seqres "${PDB_SEQRES_PATH}"
 

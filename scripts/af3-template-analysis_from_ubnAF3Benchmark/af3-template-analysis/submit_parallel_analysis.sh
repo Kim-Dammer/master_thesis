@@ -20,7 +20,7 @@ CHUNK_SIZE=1
 AF3_IMAGE="/cluster/project/beltrao/shared/alphafold3/images/alphafold3_2e2ffc1.sif"
 PROJECT_DIR="/cluster/project/beltrao/kdammer"
 DATABASE_DIR="/cluster/project/alphafold"
-PYTHON_SCRIPT="$SLURM_SUBMIT_DIR/scripts/run_chunk_analysis.py"
+PYTHON_SCRIPT="$SLURM_SUBMIT_DIR/scripts/run_chunk_analysis_mmseq2.py"
 #TRUE_IDENTITY_SCRIPT="$SLURM_SUBMIT_DIR/scripts/calculate_true_identity.py"
 PDB_SEQRES_PATH="/cluster/project/alphafold/pdb_seqres/pdb_seqres.txt"
 

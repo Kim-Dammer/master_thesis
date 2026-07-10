@@ -12,6 +12,11 @@ scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/slurm_l
 scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/test_chunk_analysis_results
 scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/chunk_analysis_results
 
+scripts/mmseq_homology_match/mmseqs
+scripts/mmseq_homology_match/slurm_logs
+scripts/mmseq_homology_match/all_queries.fasta
+scripts/mmseq_homology_match/mmseqs-linux-avx2.tar.gz
+
 .hf_cache/**
 
 # Python-generated files
