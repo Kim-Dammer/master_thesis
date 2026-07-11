@@ -25,14 +25,14 @@ set -euo pipefail
 QUERY_FASTA="/cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/all_queries.fasta"
 
 # Where to write mmseqs2 databases and results
-WORK_DIR="/cluster/project/beltrao/kdammer/master_thesis/mmseqs_run"
+WORK_DIR="/cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_e_value_100"
 
 PDB_SEQRES_PATH="/cluster/project/alphafold/pdb_seqres/pdb_seqres.txt"
 
 VENV_ACTIVATE="/cluster/project/beltrao/kdammer/master_thesis/.venv/bin/activate"
 
 THREADS=8
-SENSITIVITY=7.5   # 1 (fast/low-sensitivity) to 7.5 (max sensitivity, matches jackhmmer-ish recall)
+SENSITIVITY=8.5   # 1 (fast/low-sensitivity) to 7.5 (max sensitivity, matches jackhmmer-ish recall)
 
 # --- SCRIPT LOGIC ---
 
@@ -66,7 +66,7 @@ fi
 mmseqs createdb "$QUERY_FASTA" "$QUERY_DB"
 
 echo "=== Step 2: run the search ==="
-RESULT_TSV="/cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run/mmseqs_results.tsv"
+RESULT_TSV="/cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_e_value_100/mmseqs_results.tsv"
 TMP_DIR="$WORK_DIR/tmp"
 mkdir -p "$TMP_DIR"
 
@@ -76,6 +76,14 @@ mkdir -p "$TMP_DIR"
 mmseqs easy-search "$QUERY_FASTA" "$PDB_DB" "$RESULT_TSV" "$TMP_DIR" \
     --threads "$THREADS" \
     -s "$SENSITIVITY" \
+    --start-sens 4 \
+    --sens-steps 5 \
+    --num-iterations 3 \
+    --max-seqs 3000 \
+    --max-seq-id 1.0 \
+    --comp-bias-corr 0 \
+    --mask 0 \
+    -e 1000 \
     -a 1 \
     --format-mode 4 \
     --format-output "query,target,pident,alnlen,evalue,qlen,tlen,qaln,taln"

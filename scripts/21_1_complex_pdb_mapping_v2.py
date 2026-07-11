@@ -22,7 +22,7 @@ Outputs:
 Usage:
     uv run 21_1_complex_pdb_mapping_v2.py \
         --tsv    /cluster/project/beltrao/kdammer/master_thesis/data/Complex_Portal/Saccharomyces_cerevisiae_ComplexTab.tsv \
-        --out-dir /cluster/project/beltrao/kdammer/master_thesis/data/complete_complex_pdb_mapping_v2
+        --out-dir /cluster/project/beltrao/kdammer/master_thesis/data/complete_complex_pdb_mapping_v2/excact_pdb_match
 """
 from __future__ import annotations
 
