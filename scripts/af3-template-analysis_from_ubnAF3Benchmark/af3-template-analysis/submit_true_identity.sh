@@ -10,12 +10,12 @@
 #SBATCH --mem-per-cpu=4G
 
 # --- USER CONFIGURATION ---
-RESULTS_DIR="$SLURM_SUBMIT_DIR/chunk_analysis_results/uniqSeqs"
+RESULTS_DIR="/cluster/project/beltrao/kdammer/master_thesis/scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/chunk_analysis_results/uniqSeqs"
 
 # --- SCRIPT CONFIGURATION ---
 PROJECT_DIR="/cluster/project/beltrao/JvG"
 DATABASE_DIR="/cluster/project/alphafold"
-PYTHON_SCRIPT="$SLURM_SUBMIT_DIR/scripts/run_single_true_identity.py"
+PYTHON_SCRIPT="/cluster/project/beltrao/kdammer/master_thesis/scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/scripts/run_single_true_identity.py"
 PDB_SEQRES_PATH="/cluster/project/alphafold/pdb_seqres/pdb_seqres.txt"
 
 # Venv config (uv-managed)
@@ -25,7 +25,7 @@ VENV_ACTIVATE="/cluster/project/beltrao/kdammer/master_thesis/.venv/bin/activate
 
 # Master job logic (submits the array)
 if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
-    SLURM_LOG_DIR="$SLURM_SUBMIT_DIR/slurm_logs"
+    SLURM_LOG_DIR="/cluster/project/beltrao/kdammer/master_thesis/scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/slurm_logs"
     mkdir -p "$SLURM_LOG_DIR"
     echo "Slurm logs will be saved in: $SLURM_LOG_DIR"
 
@@ -33,7 +33,7 @@ if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
 
     UNPROCESSED_FOLDERS=()
     for folder in $(find "$RESULTS_DIR" -mindepth 1 -maxdepth 1 -type d | sort); do
-        if [ ! -f "$folder/true_identity.csv" ]; then
+        if [ ! -f "$folder/true_identity_standard_mmseq2_scoring.csv" ]; then
             if ls "$folder"/*_templates.txt 1> /dev/null 2>&1; then
                 UNPROCESSED_FOLDERS+=("$folder")
                 echo "  [QUEUE] $(basename "$folder")"

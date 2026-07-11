@@ -16,6 +16,7 @@ from pathlib import Path
 import argparse
 import sys
 from Bio import SeqIO, Align
+from Bio.Align import substitution_matrices
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
@@ -99,13 +100,18 @@ def calculate_identity(seq1: str, seq2: str) -> float:
         return 0.0
     
     # Use PairwiseAligner (much faster than pairwise2)
-    aligner = Align.PairwiseAligner()
-    aligner.mode = 'global'
-    aligner.match_score = 1
-    aligner.mismatch_score = 0
-    aligner.open_gap_score = -0.5
-    aligner.extend_gap_score = -0.1
+    # aligner = Align.PairwiseAligner()
+    # aligner.mode = 'global'
+    # aligner.match_score = 1
+    # aligner.mismatch_score = 0
+    # aligner.open_gap_score = -0.5
+    # aligner.extend_gap_score = -0.1
     
+    aligner = Align.PairwiseAligner()
+    aligner.mode = 'local'                          # local, not global
+    aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")    
+    aligner.open_gap_score = -11                    # strict, not -0.5
+    aligner.extend_gap_score = -1                   # strict, not -0.1
     # Get the best alignment
     alignments = aligner.align(seq1, seq2)
     
@@ -115,14 +121,14 @@ def calculate_identity(seq1: str, seq2: str) -> float:
         return 0.0
     
     # Count matches
-    aligned_seq1, aligned_seq2 = best_alignment
-    matches = sum(1 for a, b in zip(aligned_seq1, aligned_seq2) 
-                  if a == b and a != '-' and b != '-')
+    #! The following section is hard-coded binary, in either case, use best_alignment.score directly 
+    # aligned_seq1, aligned_seq2 = best_alignment
+    # matches = sum(1 for a, b in zip(aligned_seq1, aligned_seq2) 
+    #               if a == b and a != '-' and b != '-')
+    # # Calculate identity as matches / length of query sequence
+    # identity = (matches / len(seq1)) * 100
     
-    # Calculate identity as matches / length of query sequence
-    identity = (matches / len(seq1)) * 100
-    
-    return identity
+    return best_alignment.score
 
 
 def parse_hmmer_hits(hmmer_output_file: Path, max_hits: int = 10000000) -> list[str]:
@@ -225,7 +231,7 @@ def process_single_folder(
                 logger.error(f"Error calculating identity for {hit_pdb_id}: {e}")
     
     # Write results to CSV in the protein folder
-    output_csv = protein_folder / "true_identity.csv"
+    output_csv = protein_folder / "true_identity_standard_mmseq2_scoring.csv"
     
     try:
         with open(output_csv, 'w', newline='') as f:
