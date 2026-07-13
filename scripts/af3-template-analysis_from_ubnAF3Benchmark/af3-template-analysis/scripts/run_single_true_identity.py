@@ -109,7 +109,7 @@ def calculate_identity(seq1: str, seq2: str) -> float:
     
     aligner = Align.PairwiseAligner()
     aligner.mode = 'local'                          # local, not global
-    aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")    
+    # aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")    
     aligner.open_gap_score = -11                    # strict, not -0.5
     aligner.extend_gap_score = -1                   # strict, not -0.1
     # Get the best alignment
@@ -121,14 +121,14 @@ def calculate_identity(seq1: str, seq2: str) -> float:
         return 0.0
     
     # Count matches
-    #! The following section is hard-coded binary, in either case, use best_alignment.score directly 
-    # aligned_seq1, aligned_seq2 = best_alignment
-    # matches = sum(1 for a, b in zip(aligned_seq1, aligned_seq2) 
-    #               if a == b and a != '-' and b != '-')
-    # # Calculate identity as matches / length of query sequence
-    # identity = (matches / len(seq1)) * 100
+    #! The following section is hard-coded binary scoring: match=1, mismatch=0, gap=-1
+    aligned_seq1, aligned_seq2 = best_alignment
+    matches = sum(1 for a, b in zip(aligned_seq1, aligned_seq2) 
+                  if a == b and a != '-' and b != '-')
+    # Calculate identity as matches / length of query sequence
+    identity = (matches / len(seq1)) * 100
     
-    return best_alignment.score
+    return identity
 
 
 def parse_hmmer_hits(hmmer_output_file: Path, max_hits: int = 10000000) -> list[str]:

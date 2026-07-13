@@ -58,3 +58,25 @@ def clean_identifiers(
         .list.join(" ")
         .alias(new_column)
     )
+
+
+
+def count_elements(
+        df: pl.DataFrame, 
+        column: str  = "Cleaned Identifiers", 
+        separator: str = " ", 
+        new_column_name: str = "n_proteins"
+        ) -> pl.DataFrame:
+    """
+    Splits a string column by a separator and counts the number of elements,
+    adding the result as a new column.
+    """
+    return df.with_columns(
+        pl.col(column)
+        .str.split(separator)
+        .list.len()
+        .alias(new_column_name)
+    )
+
+
+    
