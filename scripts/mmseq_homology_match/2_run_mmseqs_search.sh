@@ -4,7 +4,7 @@
 # Outputs a TSV with per-hit identity, e-value, and the raw aligned sequences
 # (qaln/taln), which compute_mmseqs_similarity.py then uses to add a
 # BLOSUM62-based %similarity column.
-#
+#module load stack/.2024-05-silent  gcc/13.2.0 mmseqs2/14-7e284
 # Expects QUERY_FASTA to already exist - build it first with:
 #   python build_query_fasta_from_json.py --input_dir <data dir> --output <QUERY_FASTA path>
 
@@ -22,12 +22,12 @@ set -euo pipefail
 # --- USER CONFIGURATION ---
 # Combined query FASTA, already built by build_query_fasta_from_json.py, e.g.:
 #   python build_query_fasta_from_json.py --input_dir .../data --output all_queries.fasta
-QUERY_FASTA="/cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/all_queries.fasta"
+QUERY_FASTA="/cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/all_CP_proteins_sequences.fasta"
 
 # Where to write mmseqs2 databases and results
-WORK_DIR="/cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_e_value_100"
+WORK_DIR="/cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity"
 
-PDB_SEQRES_PATH="/cluster/project/alphafold/pdb_seqres/pdb_seqres.txt"
+PDB_SEQRES_PATH="/cluster/project/beltrao/kdammer/master_thesis/data/pdb/pdb_seqres.txt"
 
 VENV_ACTIVATE="/cluster/project/beltrao/kdammer/master_thesis/.venv/bin/activate"
 
@@ -66,7 +66,8 @@ fi
 mmseqs createdb "$QUERY_FASTA" "$QUERY_DB"
 
 echo "=== Step 2: run the search ==="
-RESULT_TSV="/cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_e_value_100/mmseqs_results.tsv"
+RESULT_TSV="$WORK_DIR/mmseqs_results.tsv"
+RESULT_PARQUET="$WORK_DIR/mmseqs_results.parquet"
 TMP_DIR="$WORK_DIR/tmp"
 mkdir -p "$TMP_DIR"
 
@@ -87,6 +88,14 @@ mmseqs easy-search "$QUERY_FASTA" "$PDB_DB" "$RESULT_TSV" "$TMP_DIR" \
     -a 1 \
     --format-mode 4 \
     --format-output "query,target,pident,alnlen,evalue,qlen,tlen,qaln,taln"
+echo "=== Step 3: convert TSV result to Parquet ==="
+python -c "
+import polars as pl
+df = pl.read_csv('$RESULT_TSV', separator='\t')
+df.write_parquet('$RESULT_PARQUET')
+print(f'Wrote {df.height} rows to $RESULT_PARQUET')
+"
+rm -f "$RESULT_TSV"
 
-echo "=== Done. Raw results: $RESULT_TSV ==="
+echo "=== Done. Results: $RESULT_PARQUET ==="
 echo "Next: run compute_mmseqs_similarity.py on this file to add BLOSUM62 similarity."

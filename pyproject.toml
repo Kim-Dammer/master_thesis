@@ -31,8 +31,8 @@ build-backend = "hatchling.build"
 packages = ["src/procompa"]
 
 [tool.uv.sources]
-pooled-ppi = { git = "https://github.com/jurgjn/pooled-ppi.git", branch = "main" }
 stoic = { git = "https://github.com/PickyBinders/stoic.git" }
+pooled-ppi = { git = "https://github.com/jurgjn/pooled-ppi", rev = "develop" }
 
 [dependency-groups]
 dev = [

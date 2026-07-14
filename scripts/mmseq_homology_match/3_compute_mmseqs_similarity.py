@@ -15,9 +15,9 @@ result incrementally as Parquet. Handles 5M+ rows without stalling.
 
 Usage:
 uv run 3_compute_mmseqs_similarity.py \
-  --input /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_e_value_100/mmseqs_results.parquet \
-  --output /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_e_value_100/results/mmseqs_identity_similarity_e_value_100.parquet \
-  --summary /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_e_value_100/results/mmseqs_per_protein_summary_e_value_100.parquet
+  --input /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/mmseqs_results.parquet \
+  --output /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_identity_similarity_max_sensitivity.parquet \
+  --summary /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_per_protein_summary_max_sensitivity.parquet
 """
 
 import argparse

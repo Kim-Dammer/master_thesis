@@ -31,7 +31,7 @@ For every complex we report:
   - All other candidate PDB matches per complex are also written out,
     in case you want to browse alternatives instead of just the top pick.
 
-Assumptions (please sanity-check against your real data):
+Assumptions:
   * mmseq_results.hit_pdb_id is "<pdbid>_<chain>" (e.g. "6sv4_zY") --
     split on the FIRST "_" to recover the 4-char pdb id.
   * protein_id / Cleaned Identifiers matched case-insensitively.
@@ -49,12 +49,12 @@ Outputs (csv) written to --out-dir:
   - pdb_protein_counts.parquet    cached per-pdb distinct-protein counts
 
 Usage:
-  python match_complexes_to_pdb.py \
-      --complexes unmapped_complexes.csv \
-      --mmseq mmseq_results.parquet \
-      --pdb-seqres pdb_seqres.txt \
+  uv run 4_match_complexes_to_pdb.py \
+      --complexes /cluster/project/beltrao/kdammer/master_thesis/data/Complex_Portal/Sc_ComplexTab_cleaned.csv \ 
+      --mmseq /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_identity_similarity_max_sensitivity.parquet\
+      --pdb-seqres /cluster/project/beltrao/kdammer/master_thesis/data/pdb/pdb_seqres.txt \
       --threshold 30 \
-      --out-dir results/
+      --out-dir /cluster/project/beltrao/kdammer/master_thesis/data/complete_complex_pdb_mapping_v2/homology_pdb_mapping/
 """
 import argparse
 from pathlib import Path

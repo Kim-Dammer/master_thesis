@@ -2435,7 +2435,7 @@ wheels = [
 [[package]]
 name = "pooled-ppi"
 version = "26.0.dev0"
-source = { git = "https://github.com/jurgjn/pooled-ppi.git?branch=main#0a73e6c6708173b2343798dcaa8f3381ca149f8a" }
+source = { git = "https://github.com/jurgjn/pooled-ppi?rev=develop#96b66b986016b77dbd60133aae28e94e7c288229" }
 dependencies = [
     { name = "af3io" },
     { name = "biopython" },
@@ -2505,7 +2505,7 @@ requires-dist = [
     { name = "nglview", specifier = ">=4.0.1" },
     { name = "pandas", specifier = ">=3.0.3" },
     { name = "polars", specifier = ">=1.40.1" },
-    { name = "pooled-ppi", git = "https://github.com/jurgjn/pooled-ppi.git?branch=main" },
+    { name = "pooled-ppi", git = "https://github.com/jurgjn/pooled-ppi?rev=develop" },
     { name = "prody", specifier = ">=2.6.1" },
     { name = "py3dmol", specifier = ">=2.5.4" },
     { name = "pyarrow", specifier = ">=24.0.0" },
