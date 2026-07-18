@@ -4,11 +4,11 @@
 14_run_csv_combfold.py — Submit CombFold runs from a CSV, then parse results
 and enrich the CSV with assembly outcome and confidence.
 
-Usage (one-pass, blocks until all jobs finish):
- python 14_run_csv_combfold.py \
-     --csv pdb_present_for_stoi_gr_two_third_setup_pipeline_complexes.csv \
-     --sh scripts/05_run_CombFold.sbatch \
-     --output-base data/Pipeline/third_setup/CombFold \
+Usage:
+ uv run 14_run_combfold_wihout_stoic.py \
+     --csv /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/4_fourth_setup_CF_submission.csv\
+     --sh 05_run_CombFold.sbatch \
+     --output-base /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/4_fourth_setup \
      --mode all
 
 What gets added to the CSV (one column per):

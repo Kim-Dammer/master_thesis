@@ -13,17 +13,16 @@
 # CombFold assembly script
 #
 # Usage:
-#   sbatch run_CombFold.sbatch 'Q12186(1),P36084(2)'
-#   sbatch run_CombFold.sbatch 'Q12186(1),P36084(2),1:2'   # ratio validated
+# sbatch run_CombFold.sbatch 'Q12186(1),P36084(2)'
+# sbatch run_CombFold.sbatch 'Q12186(1),P36084(2),1:2' # ratio validated
 #
 # Single quoted argument: comma-separated NAME(COUNT) entries.
 # Optional trailing ratio (e.g. 1:2) must match the parenthesized
 # counts in the order the proteins were written.
 #
-# Pair PDB sources:
-#   - homodimers  -> AFDB merged_pdbs/{UniProtID}.pdb
-#   - heterodimers -> pooled-PPI DB
-# Missing AFDB homodimers fail loudly (no DB fallback).
+# Pair PDB sources (ALL from pooled-PPI DB now):
+# - homodimers   -> pooled-PPI DB (self-pairs: uniprot_id1 == uniprot_id2)
+# - heterodimers -> pooled-PPI DB (cross-pairs: uniprot_id1 != uniprot_id2)
 # ============================================================
 
 set -euo pipefail
@@ -34,7 +33,6 @@ SEQUENCES_PARQUET="/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.
 POOLED_PPI_DB="/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.04"
 COMBFOLD_SIF="/cluster/project/beltrao/shared/alphafold3/images/combfold_latest.sif"
 OUTPUT_BASE="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/first_setup/CombFold"
-MERGED_PDBS_DIR="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/homodimer_pdb_files/merged_pdbs"
 # ------------------------------------------------------------
 
 source "${VENV}/bin/activate"
@@ -42,7 +40,7 @@ source "${VENV}/bin/activate"
 if [[ $# -ne 1 ]]; then
     echo "ERROR: expected exactly one argument (quoted)."
     echo "Usage: sbatch $(basename "$0") 'Q12186(1),P36084(2)'"
-    echo "   or: sbatch $(basename "$0") 'Q12186(1),P36084(2),1:2'"
+    echo " or: sbatch $(basename "$0") 'Q12186(1),P36084(2),1:2'"
     exit 1
 fi
 
@@ -51,7 +49,7 @@ echo "Spec: ${SPEC}"
 
 mkdir -p logs
 
-export SPEC OUTPUT_BASE SEQUENCES_PARQUET POOLED_PPI_DB MERGED_PDBS_DIR
+export SPEC OUTPUT_BASE SEQUENCES_PARQUET POOLED_PPI_DB
 
 # --- Recompute complex name on bash side (no temp file) -----
 COMPLEX_NAME=$(python -c "
@@ -79,8 +77,8 @@ SUBUNITS_JSON="${INPUT_DIR}/subunits.json"
 mkdir -p "${INPUT_DIR}/pdbs" "${OUTPUT_DIR}"
 
 echo "Complex name: ${COMPLEX_NAME}"
-echo "Input dir:    ${INPUT_DIR}"
-echo "Output dir:   ${OUTPUT_DIR}"
+echo "Input dir: ${INPUT_DIR}"
+echo "Output dir: ${OUTPUT_DIR}"
 
 # ---- Step 1: Validate spec, write subunits.json + pairwise PDBs ----
 echo "[$(date)] Parsing spec, writing subunits.json and pairwise PDBs..."
@@ -90,7 +88,6 @@ import collections
 import json
 import os
 import re
-import shutil
 import sys
 from functools import reduce
 from math import gcd
@@ -104,57 +101,6 @@ spec = os.environ["SPEC"]
 output_base = os.environ["OUTPUT_BASE"]
 sequences_path = os.environ["SEQUENCES_PARQUET"]
 pooled_ppi_db = os.environ["POOLED_PPI_DB"]
-merged_pdbs_dir = Path(os.environ["MERGED_PDBS_DIR"])
-
-# --- AFDB homodimer helpers ---------------------------------------------
-def lookup_homodimer_pdb(uniprot_id: str) -> Path | None:
-    """Return path to merged_pdbs/{id}.pdb if it exists, else None."""
-    candidate = merged_pdbs_dir / f"{uniprot_id}.pdb"
-    return candidate if candidate.exists() else None
-
-def chains_in_pdb(path: Path) -> list[str]:
-    """Unique chain IDs (column 22) over ATOM/HETATM records, in first-seen order."""
-    seen: list[str] = []
-    with open(path) as fh:
-        for line in fh:
-            if line.startswith(("ATOM", "HETATM")):
-                ch = line[21]
-                if ch not in seen:
-                    seen.append(ch)
-    return seen
-
-def copy_homodimer_with_chains(src: Path, dst: Path, uniprot_id: str) -> None:
-    """
-    Copy src -> dst, normalizing chain IDs to A and B.
-
-    Always logs the original chain IDs found in src and whether a remap
-    was applied.
-
-    - If chains == ['A', 'B'] in that order, just copy (no remap).
-    - Else if exactly 2 distinct chains, remap first -> A, second -> B
-      by rewriting column 22 of ATOM/HETATM/TER records.
-    - Else fail (single chain or > 2 chains is unusable for a homodimer).
-    """
-    chains = chains_in_pdb(src)
-    print(f"  [{uniprot_id}] source chains: {chains}  (file: {src})")
-    if len(chains) != 2:
-        raise SystemExit(
-            f"ERROR: expected 2 chains in {src}, found {len(chains)}: {chains}. "
-            f"Cannot use as homodimer input."
-        )
-    if chains == ["A", "B"]:
-        shutil.copy(src, dst)
-        print(f"  [{uniprot_id}] no chain remap needed (already A,B)")
-        return
-    mapping = {chains[0]: "A", chains[1]: "B"}
-    with open(src) as fin, open(dst, "w") as fout:
-        for line in fin:
-            if line.startswith(("ATOM", "HETATM", "TER")) and len(line) > 21:
-                ch = line[21]
-                new_ch = mapping.get(ch, ch)
-                line = line[:21] + new_ch + line[22:]
-            fout.write(line)
-    print(f"  [{uniprot_id}] chain remap applied: {mapping}")
 
 # --- Parse spec ----------------------------------------------------------
 tokens = [t.strip() for t in spec.split(",") if t.strip()]
@@ -211,10 +157,10 @@ if ratio_token is not None:
         counts_str = ":".join(str(c) for c in listed_counts)
         ratio_str = ":".join(str(r) for r in ratio_parts)
         print("ERROR: ratio mismatch.")
-        print(f"  Proteins (order given): {proteins_in_order}")
-        print(f"  Counts from parentheses: {counts_str} "
+        print(f" Proteins (order given): {proteins_in_order}")
+        print(f" Counts from parentheses: {counts_str} "
               f"(reduced {':'.join(map(str, listed_reduced))})")
-        print(f"  Ratio token:             {ratio_str} "
+        print(f" Ratio token: {ratio_str} "
               f"(reduced {':'.join(map(str, ratio_reduced))})")
         sys.exit(1)
 
@@ -259,7 +205,7 @@ with open(subunits_path, "w") as fh:
 print(f"Written: {subunits_path}")
 
 # --- Required pairwise PDBs: split into homo and hetero ------------------
-required_homodimers = []   # list of uniprot_id with count >= 2
+required_homodimers = []  # list of uniprot_id with count >= 2
 required_heteropairs = []  # list of tuple(id1, id2), sorted
 
 for i, p1 in enumerate(proteins):
@@ -273,40 +219,50 @@ for i, p1 in enumerate(proteins):
 print(f"Required homodimers: {required_homodimers}")
 print(f"Required heteropairs: {required_heteropairs}")
 
-# --- Resolve AFDB homodimers (pre-flight, fail loud) ---------------------
-homodimer_sources: dict[str, Path] = {}
-missing_homodimers: list[str] = []
-for uid in required_homodimers:
-    src = lookup_homodimer_pdb(uid)
-    if src is None:
-        missing_homodimers.append(uid)
-    else:
-        homodimer_sources[uid] = src
+# --- Look up ALL pairs (homo + hetero) in pooled PPI DB ------------------
+# The pooled-PPI DB stores UniProt IDs in lowercase; the spec uses uppercase.
+# Build a lowercase lookup set for querying, keep original IDs for output.
+proteins_lower = {p.lower() for p in proteins}
 
-if missing_homodimers:
-    print("ERROR: missing AFDB homodimer PDB(s) in merged_pdbs/:")
-    for uid in missing_homodimers:
-        print(f"  {uid}  (expected {merged_pdbs_dir / f'{uid}.pdb'})")
-    sys.exit(1)
-
-# --- Look up heteropairs in pooled PPI DB --------------------------------
 pp = pooled_ppi.PooledPredictionsDb(pooled_ppi_db)
 
 candidates = (
     pp.pairs
-    .query("uniprot_id1 in @proteins & uniprot_id2 in @proteins")
+    .query("uniprot_id1.str.lower() in @proteins_lower & "
+           "uniprot_id2.str.lower() in @proteins_lower")
     .sort_values("af3_pair")
     .reset_index(drop=True)
 )
-candidates["pair_key"] = candidates.apply(
-    lambda r: tuple(sorted([r.uniprot_id1, r.uniprot_id2])), axis=1
-)
+# pair_key uses lowercase IDs (as stored in the DB).
+# Use a list comprehension (NOT .apply) — returning a tuple from .apply
+# makes pandas try to expand it into multiple columns, which raises
+# "Cannot set a DataFrame with multiple columns to the single column pair_key".
+candidates["pair_key"] = [
+    tuple(sorted([a.lower(), b.lower()]))
+    for a, b in zip(candidates["uniprot_id1"], candidates["uniprot_id2"])
+]
+
+available_homodimers = {
+    p[0] for p in set(candidates["pair_key"]) if p[0] == p[1]
+}
 available_heteropairs = {
     p for p in set(candidates["pair_key"]) if p[0] != p[1]
 }
 
-required_heteropair_set = set(required_heteropairs)
+# --- Check availability (compare in lowercase) ---------------------------
+required_homodimer_set = {uid.lower() for uid in required_homodimers}
+required_heteropair_set = {tuple(sorted([a.lower(), b.lower()]))
+                           for a, b in required_heteropairs}
+
+missing_homo = required_homodimer_set - available_homodimers
 missing_hetero = required_heteropair_set - available_heteropairs
+
+if missing_homo:
+    print("ERROR: missing homodimer predictions in pooled-PPI DB:")
+    for uid in sorted(missing_homo):
+        print(f"  {uid} (self-pair {uid}-{uid} not found)")
+    sys.exit(1)
+
 if missing_hetero:
     print("ERROR: missing heterodimer predictions in pooled-PPI DB:")
     for m in sorted(missing_hetero):
@@ -315,22 +271,30 @@ if missing_hetero:
           "Generate them with AF-Multimer / AF3 / Boltz first.")
     sys.exit(1)
 
-# --- Write PDBs ----------------------------------------------------------
-# Homodimers from merged_pdbs/
-print("Writing AFDB homodimers:")
-for uid, src in homodimer_sources.items():
-    dst = pdbs_dir / f"AFM_{uid}_{uid}_unrelaxed_rank_1_model_1.pdb"
-    copy_homodimer_with_chains(src, dst, uid)
-    print(f"  written: {dst}")
+# --- Write PDBs (all from pooled-PPI DB) ---------------------------------
+# Map lowercase -> original uppercase for output filenames
+lower_to_orig = {p.lower(): p for p in proteins}
 
-# Heterodimers from pooled-PPI DB
-print("Writing pooled-PPI heterodimers:")
+print("Writing homodimers from pooled-PPI DB:")
+for uid in sorted(required_homodimer_set):
+    pair = (uid, uid)
+    row = candidates.query("pair_key == @pair").iloc[0]
+    db_id1 = f'{row["name"]}_{row.af3_id1}'
+    db_id2 = f'{row["name"]}_{row.af3_id2}'
+    orig = lower_to_orig[uid]
+    path_pdb = pdbs_dir / f"AFM_{orig}_{orig}_unrelaxed_rank_1_model_1.pdb"
+    pp.save_ids([db_id1, db_id2], str(path_pdb))
+    print(f"  written: {path_pdb}")
+
+print("Writing heterodimers from pooled-PPI DB:")
 for pair in sorted(required_heteropair_set):
     row = candidates.query("pair_key == @pair").iloc[0]
     db_id1 = f'{row["name"]}_{row.af3_id1}'
     db_id2 = f'{row["name"]}_{row.af3_id2}'
+    orig1 = lower_to_orig[pair[0]]
+    orig2 = lower_to_orig[pair[1]]
     path_pdb = pdbs_dir / (
-        f"AFM_{row.uniprot_id1}_{row.uniprot_id2}_"
+        f"AFM_{orig1}_{orig2}_"
         f"unrelaxed_rank_1_model_1.pdb"
     )
     pp.save_ids([db_id1, db_id2], str(path_pdb))
@@ -346,8 +310,8 @@ singularity exec \
     --bind "${OUTPUT_BASE}" \
     "${COMBFOLD_SIF}" \
     sh -c "python /app/CombFold/scripts/run_on_pdbs.py \
-        ${SUBUNITS_JSON} \
-        ${PDBS_DIR} \
-        ${OUTPUT_DIR}"
+    ${SUBUNITS_JSON} \
+    ${PDBS_DIR} \
+    ${OUTPUT_DIR}"
 
 echo "[$(date)] CombFold finished. Output in: ${OUTPUT_DIR}"

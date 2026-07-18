@@ -342,6 +342,18 @@ wheels = [
 ]
 
 [[package]]
+name = "brokenaxes"
+version = "0.6.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/fe/24/3b8232880f8413f5e85bab6ecb5440418f071fdcbdc7090d858ee36026bb/brokenaxes-0.6.2.tar.gz", hash = "sha256:bfa68242f003c02fe57ce7b5c5671c78c733ac8cc51a2be0f3ee6906c18e5d49", size = 9783, upload-time = "2024-09-18T21:13:02.895Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/98/76/16158f60d2305cae16c07e25e9d7c5912c346071e2440fe6fe231982e0d9/brokenaxes-0.6.2-py3-none-any.whl", hash = "sha256:bc0a269c4a9a9a643504fbb7d734a279629cc2cada5ee90c57645e75c89f38ad", size = 7278, upload-time = "2024-09-18T21:13:01.44Z" },
+]
+
+[[package]]
 name = "cached-path"
 version = "1.8.10"
 source = { registry = "https://pypi.org/simple" }
@@ -1854,6 +1866,17 @@ wheels = [
 ]
 
 [[package]]
+name = "matplotlib-venn"
+version = "1.1.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e8/f7/47bddf95492f4d1370ed7164d2b16407805e8eeb38231361de65d387a562/matplotlib-venn-1.1.2.tar.gz", hash = "sha256:6f2b07a03e9bb5a62de2f32f965216739e175176f9d654dd19e7af2c22ec36e3", size = 40821, upload-time = "2025-02-25T10:44:24.294Z" }
+
+[[package]]
 name = "mdurl"
 version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2472,11 +2495,13 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "af3io" },
+    { name = "brokenaxes" },
     { name = "fastparquet" },
     { name = "hmmer" },
     { name = "ipykernel" },
     { name = "lxml" },
     { name = "marimo" },
+    { name = "matplotlib-venn" },
     { name = "nglview" },
     { name = "pandas" },
     { name = "polars" },
@@ -2497,11 +2522,13 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "af3io", specifier = ">=26.0" },
+    { name = "brokenaxes", specifier = ">=0.6.2" },
     { name = "fastparquet", specifier = ">=2026.5.0" },
     { name = "hmmer", specifier = ">=3.4.0.2" },
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "lxml", specifier = ">=6.1.0" },
     { name = "marimo", specifier = ">=0.23.5" },
+    { name = "matplotlib-venn", specifier = ">=1.1.2" },
     { name = "nglview", specifier = ">=4.0.1" },
     { name = "pandas", specifier = ">=3.0.3" },
     { name = "polars", specifier = ">=1.40.1" },

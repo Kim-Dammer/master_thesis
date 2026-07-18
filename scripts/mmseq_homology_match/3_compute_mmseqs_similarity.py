@@ -2,22 +2,20 @@
 """
 Post-process mmseqs2 easy-search output (with qaln/taln columns) to compute,
 for each query protein x PDB hit pair:
- - identity_percent : exact-match residues / full query length
- - similarity_percent : (exact matches + BLOSUM62-positive substitutions) / full query length
+ - identity_percent                : exact-match residues / full query length (original metric)
+ - similarity_percent              : (matches + BLOSUM62-positive subs) / full query length
+ - blast_identity_percent          : exact-match residues / aligned length, gaps included (standard/BLAST convention)
+ - blast_similarity_percent        : (matches + BLOSUM62-positive subs) / aligned length, gaps included
+ - alnlen, qlen, tlen              : aligned length (incl. gaps), query length, target length
+ - is_high_homology                : identity_percent > threshold (original qlen-based metric)
+ - high_homology_blast             : blast_identity_percent > threshold (standard alnlen-based metric)
+ - high_homology_blast_filtered    : high_homology_blast AND alnlen >= min-aln-len
+                                      (guards against short, coincidental high-identity matches)
 
-Both metrics are defined the same way as run_single_true_identity.py's
-true_identity_percent / true_similarity_percent, so mmseqs2 results are
-directly comparable to your existing HMMER-based true_identity.csv files.
-
-Reads a Parquet file (mmseqs2 raw output) in batches via PyArrow, computes
-identity/similarity with numpy-vectorized BLOSUM62 lookups, and writes the
-result incrementally as Parquet. Handles 5M+ rows without stalling.
-
-Usage:
 uv run 3_compute_mmseqs_similarity.py \
   --input /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/mmseqs_results.parquet \
-  --output /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_identity_similarity_max_sensitivity.parquet \
-  --summary /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_per_protein_summary_max_sensitivity.parquet
+  --output /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_new_identity_similarity_max_sensitivity.parquet \
+  --summary /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_new_per_protein_summary_max_sensitivity.parquet
 """
 
 import argparse
@@ -29,9 +27,6 @@ import polars as pl
 from Bio.Align import substitution_matrices
 
 # ── Pre-build a 128×128 ASCII-indexed BLOSUM62 score matrix ────────────
-# This replaces the per-pair try/except lookup with a single numpy
-# fancy-indexing operation: _SCORE[q_bytes, t_bytes] gives all scores
-# at once for the entire alignment.
 _BLOSUM62 = substitution_matrices.load("BLOSUM62")
 _SCORE = np.full((128, 128), -99, dtype=np.int16)
 for _a in "ACDEFGHIKLMNPQRSTVWY":
@@ -44,28 +39,33 @@ _DASH = ord("-")
 
 # ── Output Parquet schema ──────────────────────────────────────────────
 SCHEMA = pa.schema([
-    ("protein_id",         pa.string()),
-    ("hit_pdb_id",         pa.string()),
-    ("identity_percent",   pa.float64()),
-    ("similarity_percent", pa.float64()),
-    ("evalue",             pa.float64()),
-    ("alnlen",             pa.int32()),
-    ("qlen",               pa.int32()),
-    ("tlen",               pa.int32()),
-    ("is_high_homology",   pa.bool_()),
+    ("protein_id",                    pa.string()),
+    ("hit_pdb_id",                     pa.string()),
+    ("identity_percent",               pa.float64()),  # matches / qlen (original metric)
+    ("similarity_percent",             pa.float64()),  # matches+similar / qlen (original metric)
+    ("blast_identity_percent",         pa.float64()),  # matches / alnlen, gaps included (standard/BLAST)
+    ("blast_similarity_percent",       pa.float64()),  # matches+similar / alnlen, gaps included (standard/BLAST)
+    ("evalue",                         pa.float64()),
+    ("alnlen",                         pa.int32()),
+    ("qlen",                           pa.int32()),
+    ("tlen",                           pa.int32()),
+    ("is_high_homology",               pa.bool_()),    # original qlen-based metric
+    ("high_homology_blast",            pa.bool_()),    # standard alnlen-based metric
+    ("high_homology_blast_filtered",   pa.bool_()),    # + minimum alignment length cutoff
 ])
 
 BATCH_SIZE = 100_000
 
 
-def compute_identity_similarity(qaln: str, taln: str, qlen: int) -> tuple[float, float]:
+def compute_identity_similarity(qaln: str, taln: str, qlen: int) -> tuple[float, float, float, float, int]:
     """
     qaln/taln are already-aligned (same length, '-' = gap) strings from mmseqs2.
-    Returns (identity_percent, similarity_percent), both as % of full query length.
+    Returns (identity_percent, similarity_percent, blast_identity_percent,
+              blast_similarity_percent, total_aligned_len).
 
-    Uses numpy vectorized operations instead of a per-character Python loop:
-    - np.frombuffer gives an O(1) view of the ASCII bytes
-    - _SCORE[q, t] does the BLOSUM62 lookup for ALL positions at once
+    - identity_percent / similarity_percent: normalized by full query length (qlen)
+    - blast_identity_percent / blast_similarity_percent: normalized by total aligned
+      length INCLUDING gap columns (len(qaln)), following BLAST/mmseqs' own alnlen convention
     """
     q = np.frombuffer(qaln.upper().encode("ascii"), dtype=np.uint8)
     t = np.frombuffer(taln.upper().encode("ascii"), dtype=np.uint8)
@@ -74,9 +74,15 @@ def compute_identity_similarity(qaln: str, taln: str, qlen: int) -> tuple[float,
     matches = int(np.count_nonzero(non_gap & (q == t)))
     similar = int(np.count_nonzero(non_gap & (_SCORE[q, t] > 0)))
 
+    total_aligned_len = len(q)  # includes gap columns — standard BLAST/mmseqs alnlen convention
+
     identity = (matches / qlen) * 100 if qlen else 0.0
     similarity = (similar / qlen) * 100 if qlen else 0.0
-    return identity, similarity
+
+    blast_identity = (matches / total_aligned_len) * 100 if total_aligned_len else 0.0
+    blast_similarity = (similar / total_aligned_len) * 100 if total_aligned_len else 0.0
+
+    return identity, similarity, blast_identity, blast_similarity, total_aligned_len
 
 
 def main():
@@ -87,10 +93,14 @@ def main():
     parser.add_argument("--output", required=True, help="Output Parquet: one row per (protein, hit) pair")
     parser.add_argument("--summary", required=True, help="Output Parquet: one row per protein (best hit)")
     parser.add_argument("--identity-threshold", type=float, default=30.0,
-                        help="Identity %% threshold for is_high_homology flag (default: 30.0)")
+                        help="Identity %% threshold for homology flags (default: 30.0)")
+    parser.add_argument("--min-aln-len", type=int, default=30,
+                        help="Minimum alignment length (aa, incl. gaps) for high_homology_blast_filtered "
+                             "(default: 30, guards against short coincidental matches)")
     args = parser.parse_args()
 
     threshold = args.identity_threshold
+    min_aln_len = args.min_aln_len
 
     # ── Stream the input Parquet in batches ────────────────────────────
     pf = pq.ParquetFile(args.input)
@@ -101,10 +111,9 @@ def main():
 
     batch = []
     total_rows = 0
-    best_per_protein = {}  # protein_id -> best row dict (by identity)
+    best_per_protein = {}  # protein_id -> best row dict (by blast_identity_percent)
 
     for arrow_batch in pf.iter_batches(batch_size=BATCH_SIZE):
-        # Convert batch to Python dicts (only the columns we need)
         cols = {name: arrow_batch.column(name).to_pylist()
                 for name in ("query", "target", "evalue", "alnlen",
                              "qlen", "tlen", "qaln", "taln")}
@@ -116,28 +125,35 @@ def main():
             qaln = cols["qaln"][i]
             taln = cols["taln"][i]
 
-            identity, similarity = compute_identity_similarity(qaln, taln, qlen)
+            identity, similarity, blast_identity, blast_similarity, total_aligned_len = (
+                compute_identity_similarity(qaln, taln, qlen)
+            )
+
+            is_blast_homology = blast_identity > threshold
 
             out_row = {
-                "protein_id":         protein_id,
-                "hit_pdb_id":         hit_pdb_id,
-                "identity_percent":   round(identity, 2),
-                "similarity_percent": round(similarity, 2),
-                "evalue":             float(cols["evalue"][i]),
-                "alnlen":             int(cols["alnlen"][i]),
-                "qlen":               int(qlen),
-                "tlen":               int(cols["tlen"][i]),
-                "is_high_homology":   identity > threshold,
+                "protein_id":                    protein_id,
+                "hit_pdb_id":                     hit_pdb_id,
+                "identity_percent":               round(identity, 2),
+                "similarity_percent":             round(similarity, 2),
+                "blast_identity_percent":         round(blast_identity, 2),
+                "blast_similarity_percent":       round(blast_similarity, 2),
+                "evalue":                         float(cols["evalue"][i]),
+                "alnlen":                         int(cols["alnlen"][i]),
+                "qlen":                           int(qlen),
+                "tlen":                           int(cols["tlen"][i]),
+                "is_high_homology":               identity > threshold,
+                "high_homology_blast":            is_blast_homology,
+                "high_homology_blast_filtered":   is_blast_homology and total_aligned_len >= min_aln_len,
             }
             batch.append(out_row)
             total_rows += 1
 
-            # Track best hit per protein
+            # Track best hit per protein (ranked by blast_identity_percent)
             current_best = best_per_protein.get(protein_id)
-            if current_best is None or identity > current_best["identity_percent"]:
+            if current_best is None or blast_identity > current_best["blast_identity_percent"]:
                 best_per_protein[protein_id] = out_row
 
-        # Flush batch to Parquet
         table = pa.Table.from_pylist(batch, schema=SCHEMA)
         writer.write_table(table)
         batch.clear()
@@ -152,8 +168,13 @@ def main():
 
     n_proteins = len(best_per_protein)
     n_with_homology = int(df_summary["is_high_homology"].sum())
+    n_with_homology_blast = int(df_summary["high_homology_blast"].sum())
+    n_with_homology_blast_filtered = int(df_summary["high_homology_blast_filtered"].sum())
     print(f"Processed {total_rows:,} hits across {n_proteins} proteins.")
-    print(f"{n_with_homology}/{n_proteins} proteins have a best hit above {threshold}% identity.")
+    print(f"{n_with_homology}/{n_proteins} proteins have a best hit above {threshold}% identity (qlen-based).")
+    print(f"{n_with_homology_blast}/{n_proteins} proteins have a best hit above {threshold}% BLAST identity (alnlen-based).")
+    print(f"{n_with_homology_blast_filtered}/{n_proteins} proteins have a best hit above {threshold}% BLAST identity "
+          f"AND alignment length >= {min_aln_len} aa (filtered).")
     print(f"Per-hit results:   {args.output}")
     print(f"Per-protein summary: {args.summary}")
 
