@@ -9,19 +9,28 @@ Usage:
      --csv /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/4_fourth_setup_CF_submission.csv\
      --sh 05_run_CombFold.sbatch \
      --output-base /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/4_fourth_setup \
-     --mode all
+     --mode all \
+     --paired-model both
 
-What gets added to the CSV (one column per):
- combfold_successfully True / False (any output_clustered_*.pdb in assembled_results/)
- n_assembled_outputs int (number of output_clustered_*.pdb files)
- confidence_scores str (semicolon-separated: "0:81.89;1:81.46" — cluster_idx:score)
+--paired-model controls which AF3 input_type the pairwise dimer PDBs are
+pulled from (passed through to 05_run_CombFold.sbatch as a second sbatch
+arg):
+  pool (default) - best-ranked model from a pooled co-folding job
+  pair           - best-ranked model from a direct pairwise job
+  both           - submit BOTH runs per spec, in source-suffixed dirs
+                    (<complex_name>_pair_output/, <complex_name>_pool_output/)
+
+What gets added to the CSV (one column per, per source):
+ combfold_successfully_<source>  True / False (any output_clustered_*.pdb)
+ n_assembled_outputs_<source>    int
+ confidence_scores_<source>      str ("0:81.89;1:81.46" — cluster_idx:score)
 
 Assumptions:
  - The CSV has a column called 'comb_fold_submission' with specs like
    'P00937(1),P00899(2)'.
- - CombFold output layout:
-     <OUTPUT_BASE>/<complex_name>_output/assembled_results/output_clustered_N.pdb
-     <OUTPUT_BASE>/<complex_name>_output/assembled_results/confidence.txt
+ - CombFold output layout (per source):
+     <OUTPUT_BASE>/<complex_name>_<source>_output/assembled_results/output_clustered_N.pdb
+     <OUTPUT_BASE>/<complex_name>_<source>_output/assembled_results/confidence.txt
 
 """
 
@@ -73,6 +82,13 @@ def spec_to_proteins(spec: str) -> list[str]:
     return sorted(set(proteins))
 
 
+def sources_for(paired_model: str) -> list[str]:
+    """Expand --paired-model into the list of sources to run."""
+    if paired_model == "both":
+        return ["pair", "pool"]
+    return [paired_model]
+
+
 def patch_combfold_sbatch(sh_path: Path, output_base: Path) -> Path:
     """Patch 05_run_CombFold.sbatch so OUTPUT_BASE and log paths point at
     the requested directory.
@@ -117,11 +133,12 @@ def patch_combfold_sbatch(sh_path: Path, output_base: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def submit(df: pd.DataFrame, csv_path: Path, sh_path: Path,
-           output_base: Path, dry_run: bool = False) -> None:
-    """Submit one sbatch per unique spec, record job IDs in a sidecar file.
+           output_base: Path, sources: list[str], dry_run: bool = False) -> None:
+    """Submit one sbatch per (unique spec, source), record job IDs in a
+    sidecar file.
 
-    Duplicate specs in the CSV are submitted only once; all rows sharing
-    a spec get the same slurm_job_id in the registry.
+    Duplicate specs in the CSV are submitted only once per source; all rows
+    sharing a spec get the same slurm_job_id per source in the registry.
     """
     # --- Patch the sbatch ----------------------------------------------------
     output_base.mkdir(parents=True, exist_ok=True)
@@ -135,48 +152,54 @@ def submit(df: pd.DataFrame, csv_path: Path, sh_path: Path,
         spec_to_rows.setdefault(spec, []).append(int(idx))
 
     unique_specs = list(spec_to_rows.keys())
-    print(f"CSV has {len(df)} rows, {len(unique_specs)} unique specs")
+    print(f"CSV has {len(df)} rows, {len(unique_specs)} unique specs, "
+          f"sources={sources} -> {len(unique_specs) * len(sources)} submissions")
 
-    # --- Submit each unique spec once ----------------------------------------
-    spec_job_map: dict[str, int | None] = {}
+    # --- Submit each (unique spec, source) once ------------------------------
+    spec_source_job_map: dict[tuple[str, str], int | None] = {}
 
     for spec in unique_specs:
         complex_name = spec_to_complex_name(spec)
         csv_rows = spec_to_rows[spec]
 
-        if dry_run:
-            print(f"[DRY-RUN] sbatch {patched_sh} '{spec}' -> {complex_name} "
-                  f"(rows {csv_rows})")
-            spec_job_map[spec] = None
-            continue
+        for source in sources:
+            if dry_run:
+                print(f"[DRY-RUN] sbatch {patched_sh} '{spec}' {source} -> "
+                      f"{complex_name}_{source} (rows {csv_rows})")
+                spec_source_job_map[(spec, source)] = None
+                continue
 
-        cmd = ["sbatch", str(patched_sh), spec]
-        print(f"Submitting: {' '.join(cmd)} (rows {csv_rows})")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"  FAILED: {result.stderr.strip()}")
-            spec_job_map[spec] = None
-            continue
+            cmd = ["sbatch", str(patched_sh), spec, source]
+            print(f"Submitting: {' '.join(cmd)} (rows {csv_rows})")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"  FAILED: {result.stderr.strip()}")
+                spec_source_job_map[(spec, source)] = None
+                continue
 
-        m = re.search(r"Submitted batch job (\d+)", result.stdout)
-        job_id = int(m.group(1)) if m else None
-        print(f"  -> job {job_id}, complex {complex_name}")
-        spec_job_map[spec] = job_id
+            m = re.search(r"Submitted batch job (\d+)", result.stdout)
+            job_id = int(m.group(1)) if m else None
+            print(f"  -> job {job_id}, complex {complex_name}_{source}")
+            spec_source_job_map[(spec, source)] = job_id
 
-    # --- Build per-row registry ----------------------------------------------
+    # --- Build per-row-per-source registry ------------------------------------
     registry: list[dict[str, Any]] = []
     for idx, row in df.iterrows():
         spec = str(row["comb_fold_submission"])
         complex_name = spec_to_complex_name(spec)
-        entry: dict[str, Any] = {
-            "csv_row": int(idx),
-            "spec": spec,
-            "complex_name": complex_name,
-            "slurm_job_id": spec_job_map.get(spec),
-        }
-        if spec_job_map.get(spec) is None and not dry_run:
-            entry["submit_error"] = "sbatch failed or no job ID parsed"
-        registry.append(entry)
+        for source in sources:
+            job_id = spec_source_job_map.get((spec, source))
+            entry: dict[str, Any] = {
+                "csv_row": int(idx),
+                "spec": spec,
+                "complex_name": complex_name,
+                "source": source,
+                "run_name": f"{complex_name}_{source}",
+                "slurm_job_id": job_id,
+            }
+            if job_id is None and not dry_run:
+                entry["submit_error"] = "sbatch failed or no job ID parsed"
+            registry.append(entry)
 
     # Write sidecar
     sidecar_path = csv_path.with_name(csv_path.stem + "_job_registry.json")
@@ -239,37 +262,38 @@ def parse_confidence_txt(conf_path: Path) -> dict[int, float]:
     return scores
 
 
-def analyze(df: pd.DataFrame, csv_path: Path, output_base: Path) -> None:
-    """Parse CombFold outputs and enrich the CSV (no iptm columns)."""
-    # Prepare new columns
-    col_success: list[bool] = []
-    col_n_outputs: list[int] = []
-    col_confidence: list[str] = []
-
-    # Cache parsed results per complex_name (avoids re-reading same dir for duplicate specs)
+def analyze(df: pd.DataFrame, csv_path: Path, output_base: Path, sources: list[str]) -> None:
+    """Parse CombFold outputs for each source and enrich the CSV
+    (columns suffixed _<source>, no iptm columns)."""
+    # Cache parsed results per run_name (avoids re-reading same dir for duplicate specs)
     parsed_cache: dict[str, dict[str, Any]] = {}
 
-    for idx, row in df.iterrows():
-        spec = str(row["comb_fold_submission"])
-        complex_name = spec_to_complex_name(spec)
+    for source in sources:
+        col_success: list[bool] = []
+        col_n_outputs: list[int] = []
+        col_confidence: list[str] = []
 
-        # Use cache if we already parsed this complex_name
-        if complex_name in parsed_cache:
-            cached = parsed_cache[complex_name]
-            col_success.append(cached["success"])
-            col_n_outputs.append(cached["n_outputs"])
-            col_confidence.append(cached["confidence_str"])
-        else:
-            output_dir = output_base / f"{complex_name}_output"
+        for idx, row in df.iterrows():
+            spec = str(row["comb_fold_submission"])
+            complex_name = spec_to_complex_name(spec)
+            run_name = f"{complex_name}_{source}"
+
+            if run_name in parsed_cache:
+                cached = parsed_cache[run_name]
+                col_success.append(cached["success"])
+                col_n_outputs.append(cached["n_outputs"])
+                col_confidence.append(cached["confidence_str"])
+                continue
+
+            output_dir = output_base / f"{run_name}_output"
             assembled_dir = output_dir / "assembled_results"
 
             # --- Assembly success ---
-            # Skip if complex_name exceeds filesystem limit (255 bytes per component)
+            # Skip if run_name exceeds filesystem limit (255 bytes per component)
             # CombFold would have failed to create the directory anyway.
-            name_too_long = len(complex_name) > 255
+            name_too_long = len(run_name) > 255
             if name_too_long:
-                print(f"  row {idx}: {complex_name[:60]}... -> SKIPPED (name too long: {len(complex_name)} chars)")
-                output_pdbs = []
+                print(f"  row {idx} [{source}]: {run_name[:60]}... -> SKIPPED (name too long: {len(run_name)} chars)")
                 n_outputs = 0
                 success = False
             else:
@@ -282,7 +306,6 @@ def analyze(df: pd.DataFrame, csv_path: Path, output_base: Path) -> None:
                     n_outputs = len(output_pdbs)
                     success = n_outputs > 0
                 else:
-                    output_pdbs = []
                     n_outputs = 0
                     success = False
 
@@ -292,28 +315,24 @@ def analyze(df: pd.DataFrame, csv_path: Path, output_base: Path) -> None:
             else:
                 conf_path = assembled_dir / "confidence.txt"
                 scores = parse_confidence_txt(conf_path)
-            if scores:
-                confidence_str = ";".join(f"{k}:{v:.4f}" for k, v in sorted(scores.items()))
-            else:
-                confidence_str = ""
+            confidence_str = ";".join(f"{k}:{v:.4f}" for k, v in sorted(scores.items())) if scores else ""
 
             col_success.append(success)
             col_n_outputs.append(n_outputs)
             col_confidence.append(confidence_str)
 
-            parsed_cache[complex_name] = {
+            parsed_cache[run_name] = {
                 "success": success,
                 "n_outputs": n_outputs,
                 "confidence_str": confidence_str,
             }
 
-            print(f"  row {idx}: {complex_name} -> success={success}, n_outputs={n_outputs}, "
+            print(f"  row {idx} [{source}]: {run_name} -> success={success}, n_outputs={n_outputs}, "
                   f"confidence={scores if scores else 'N/A'}")
 
-    # Add columns to DataFrame
-    df["combfold_successfully"] = col_success
-    df["n_assembled_outputs"] = col_n_outputs
-    df["confidence_scores"] = col_confidence
+        df[f"combfold_successfully_{source}"] = col_success
+        df[f"n_assembled_outputs_{source}"] = col_n_outputs
+        df[f"confidence_scores_{source}"] = col_confidence
 
     # Write enriched CSV
     out_path = csv_path.with_name(csv_path.stem + "_combfold_results.csv")
@@ -337,6 +356,10 @@ def main():
                     help="CombFold output base directory (default: first_setup/CombFold)")
     ap.add_argument("--mode", choices=["submit", "analyze", "all"], default="all",
                     help="submit: sbatch all rows | analyze: parse results | all: submit+wait+analyze")
+    ap.add_argument("--paired-model", choices=["pair", "pool", "both"], default="pool",
+                    help="Which AF3 input_type to source pairwise dimer PDBs from. "
+                         "'both' submits/analyzes both pair and pool runs per spec "
+                         "(default: pool)")
     ap.add_argument("--dry-run", action="store_true",
                     help="(submit mode) print commands without running")
     ap.add_argument("--poll-interval", type=int, default=60,
@@ -347,6 +370,7 @@ def main():
         sys.exit(f"CSV not found: {args.csv}")
 
     output_base = args.output_base.resolve()
+    sources = sources_for(args.paired_model)
 
     df = pd.read_csv(args.csv)
     if "comb_fold_submission" not in df.columns:
@@ -355,12 +379,13 @@ def main():
 
     print(f"Loaded {len(df)} rows from {args.csv}")
     print(f"Output base: {output_base}")
+    print(f"Paired model source(s): {sources}")
 
     if args.mode in ("submit", "all"):
         if not args.sh.exists():
             sys.exit(f"05_run_CombFold.sbatch not found: {args.sh}")
         submit(df, args.csv, sh_path=args.sh, output_base=output_base,
-               dry_run=args.dry_run)
+               sources=sources, dry_run=args.dry_run)
 
     if args.mode == "all":
         sidecar_path = args.csv.with_name(args.csv.stem + "_job_registry.json")
@@ -371,7 +396,7 @@ def main():
                 wait_for_jobs(registry, poll_interval=args.poll_interval)
 
     if args.mode in ("analyze", "all"):
-        analyze(df, args.csv, output_base=output_base)
+        analyze(df, args.csv, output_base=output_base, sources=sources)
 
 
 if __name__ == "__main__":
