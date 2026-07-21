@@ -3,7 +3,7 @@
 
 14_run_csv_combfold.py — Submit CombFold runs from a CSV, then parse results
 and enrich the CSV with assembly outcome and confidence.
-
+if needed: rm /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/logs/*.{out,err}
 Usage:
  uv run 14_run_combfold_wihout_stoic.py \
      --csv /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/4_fourth_setup_CF_submission.csv\
