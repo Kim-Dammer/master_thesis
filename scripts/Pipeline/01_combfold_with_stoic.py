@@ -1,8 +1,16 @@
 #!/usr/bin/env python
 """
+
+#TODO: change Subpaths
 13_second_setup_pipeline.py
 ===========================
-run with uv run scripts/13_second_setup_pipeline.py --mode all     --input-csv data/Pipeline/first_setup/all_pdb_present_first_setup_pipeline_complexes.csv     --out-dir   data/Pipeline/second_setup     --stoic-sh    scripts/03_run_stoic.sbatch     --combfold-sh scripts/05_run_CombFold.sbatch     --analyze-sh  scripts/12_analyze.sbatch
+uv run 01_combfold_with_stoic.py \
+        --mode all     
+        --input-csv data/Pipeline/first_setup/all_pdb_present_first_setup_pipeline_complexes.csv     
+        --out-dir   data/Pipeline/second_setup     
+        --stoic-sh    s1_run_stoic.sbatch     
+        --combfold-sh s2_run_CombFold.sbatch     
+        --analyze-sh  s3_analyze_CF_results.sbatch
 
 Single orchestrator for the second-setup Stoic + CombFold pipeline.
 

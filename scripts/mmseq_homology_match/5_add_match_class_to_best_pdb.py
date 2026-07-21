@@ -7,7 +7,7 @@ uv run 5_add_match_class_to_best_pdb.py \
         --mmeseq_homogy_results /cluster/project/beltrao/kdammer/master_thesis/data/complete_complex_pdb_mapping_v2/homology_pdb_mapping \
         --complex_portal_tsv /cluster/project/beltrao/kdammer/master_thesis/data/Complex_Portal/Saccharomyces_cerevisiae_ComplexTab.tsv \
         --exact_pdb_match_csv /cluster/project/beltrao/kdammer/master_thesis/data/complete_complex_pdb_mapping_v2/exact_pdb_match/best_coverage_complex/best_coverage_download_log.csv \
-        --output /cluster/project/beltrao/kdammer/master_thesis/data/complete_complex_pdb_mapping_v2/pipeline_all_pdb_matches.csv
+        --output /cluster/project/beltrao/kdammer/master_thesis/data/complete_complex_pdb_mapping_v2/all_pdb_matches.csv
 """
 
 import argparse
