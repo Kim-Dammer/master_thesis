@@ -20,6 +20,8 @@ scripts/mmseq_homology_match/mmseqs-linux-avx2.tar.gz
 scripts/exploratory/*.txt
 scripts/homomultimers/minimal_working_example/*.csv
 scripts/homomultimers/minimal_working_example/*.pdb
+scripts/homomultimers/minimal_working_example/logs
+scripts/homomultimers/logs
 
 scripts/slurm_logs
 scripts/homomultimers/logs
