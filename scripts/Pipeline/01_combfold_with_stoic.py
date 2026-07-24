@@ -1,32 +1,47 @@
 #!/usr/bin/env python
 """
-
-#TODO: change Subpaths
-13_second_setup_pipeline.py
+rm /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/logs/*.{out,err}
+rm -r /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/5_fifth_setup_all_CP/*_{input,output}
+rm -r /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/5_fifth_setup_all_CP/pdb_source_logs
 ===========================
 uv run 01_combfold_with_stoic.py \
-        --mode all     
-        --input-csv data/Pipeline/first_setup/all_pdb_present_first_setup_pipeline_complexes.csv     
-        --out-dir   data/Pipeline/second_setup     
-        --stoic-sh    s1_run_stoic.sbatch     
-        --combfold-sh s2_run_CombFold.sbatch     
-        --analyze-sh  s3_analyze_CF_results.sbatch
+        --mode all \
+        --input-tsv  /cluster/project/beltrao/kdammer/master_thesis/data/Complex_Portal/Saccharomyces_cerevisiae_ComplexTab.tsv\
+        --seq-csv    /cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/all_yeast_proteins_uniprot_mapped_sequences.csv \
+        --out-dir    /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/5_fifth_setup_all_CP\
+        --stoic-sh   s1_run_stoic.sbatch \
+        --combfold-sh s2_run_CombFold.sbatch \
+        --analyze-sh s3_analyze_CF_results.sbatch \
+        --top-n 10 --combfold-source pool
 
 Single orchestrator for the second-setup Stoic + CombFold pipeline.
 
 Pipeline:
-    fasta -> submit-stoic -> aggregate-stoic -> expand -> submit-combfold -> analyze
+    raw TSV -> fasta -> submit-stoic -> aggregate-stoic -> expand
+            -> submit-combfold -> analyze
+
+Front-end (new): the fasta stage reads a raw ComplexPortal TSV, applies
+procompa.helpers.clean_identifiers to build a one-copy-per-protein
+'cleaned_complex' seed, parses the original (n) counts into 'true_spec', and
+writes FASTAs using ONLY the local --seq-csv sequences (no UniProt API).
+Complexes with any protein ID missing from the local CSV are skipped + logged.
+
+The 'combfold_submission' column (the spec actually sent to CombFold) is filled
+in the expand stage from Stoic's predicted stoichiometries (plus the curated
+true_spec row). Every CombFold job is submitted with SOURCE=pool by default.
 
 Run with --mode all to submit the whole chain via sbatch dependencies
 (no blocking polling). Or run any single mode independently.
 
 Layout written:
     <out_dir>/
+        cleaned_complexes.csv          (#Complex ac, cleaned_complex, true_spec, ...)
+        missing_ids_complexes.txt      (skipped complexes + missing IDs)
         fastas/<CPX>.fasta
         uniprot_mapped_seq_second_setup.csv
         stoic_results/<CPX>/{af3_input_*.json, results.json}
         stoic_results_aggregated_second_setup.csv
-        second_setup_expanded.csv
+        second_setup_expanded.csv      (adds combfold_submission per Stoic pred)
         second_setup_job_registry.json
         CombFold/<complex_name>_output/...
         all_pdb_present_second_setup_pipeline_complexes_combfold_results.csv
@@ -45,7 +60,27 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import requests
+import polars as pl
+import requests  # used ONLY for targeted PRO-chain sub-sequence resolution
+
+# clean_identifiers comes from the project's helper package. It drops CHEBI
+# entries and strips the trailing "(n)" stoichiometry suffix, turning
+#   "P32797(0)|P38960(0)|CHEBI:49601(0)|Q07921(0)"
+# into
+#   "P32797 P38960 Q07921"
+from procompa.helpers import clean_identifiers
+
+# ---------------------------------------------------------------------------
+# SETUP_NAME: the ONE place to rename a run. It is interpolated into every
+# setup-tagged output filename (uniprot_mapped_seq_<name>.csv,
+# <name>_expanded.csv, <name>_job_registry.json, stoic_results_aggregated_
+# <name>.csv, all_pdb_present_<name>_pipeline_..._results.csv). Override at the
+# command line with --setup-name without editing this file.
+SETUP_NAME = "fifth_setup"
+
+# Raw ComplexPortal column that holds the pipe-separated molecule identifiers.
+MOLECULES_COL = "Identifiers (and stoichiometry) of molecules in complex"
+COMPLEX_AC_COL = "#Complex ac"
 
 
 # ---------------------------------------------------------------------------
@@ -91,30 +126,168 @@ def spec_to_proteins(spec: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Raw ComplexPortal TSV parsing helpers
+# ---------------------------------------------------------------------------
+
+# Plain UniProt accession (Swiss-Prot / TrEMBL syntax).
+_UNIPROT_ACCESSION = r"[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2}"
+# A foldable subunit token = plain accession OR a processed-chain id
+# "<accession>-PRO_<digits>". Each may carry a trailing "(n)" stoichiometry.
+_SUBUNIT_RE = re.compile(rf"^((?:{_UNIPROT_ACCESSION})(?:-PRO_\d+)?)\((\d+)\)$")
+# Tokens we intentionally drop WITHOUT skipping the complex.
+_DROP_PREFIXES = ("CHEBI:", "URS")
+# PRO-chain token detector (after stripping the "(n)" suffix).
+_PRO_TOKEN_RE = re.compile(rf"^({_UNIPROT_ACCESSION})-PRO_(\d+)$")
+
+
+def _strip_count(tok: str) -> tuple[str, int | None]:
+    """Split 'X(2)' -> ('X', 2); 'X' -> ('X', None)."""
+    m = re.match(r"^(.*)\((\d+)\)$", tok)
+    if m:
+        return m.group(1), int(m.group(2))
+    return tok, None
+
+
+def classify_molecules(molecules: str) -> tuple[dict[str, int], bool, list[str]]:
+    """Classify the raw ComplexPortal molecules string.
+
+    Input example: "P32797(0)|P38960(0)|CHEBI:49601(0)|Q07921(0)"
+
+    Rules:
+      * Keep plain UniProt accessions and processed-chain ids (X-PRO_NNN) as
+        foldable subunits. "(0)" (unknown) -> count 1; positive count kept as-is.
+      * Silently drop CHEBI and URS (RNAcentral) tokens.
+      * Any OTHER token type (paralog sets '[A,B]', nested complex refs 'CPX-...',
+        'EBI-...', etc.) is treated as a hard blocker: the whole complex must be
+        skipped. Such tokens are returned in `blockers`.
+
+    Returns:
+      (counts, all_unknown, blockers)
+        counts       {subunit_id: count>=1} in first-seen order (protein order)
+        all_unknown  True if every retained subunit had "(0)"
+        blockers     list of offending tokens; non-empty => skip the complex
+    """
+    counts: dict[str, int] = {}
+    blockers: list[str] = []
+    n_subunits = 0
+    n_unknown = 0
+    for tok in [t.strip() for t in str(molecules).split("|") if t.strip()]:
+        base, _ = _strip_count(tok)
+        m = _SUBUNIT_RE.match(tok)
+        if m:
+            uid = m.group(1)
+            raw = int(m.group(2))
+            n_subunits += 1
+            if raw == 0:
+                n_unknown += 1
+                counts[uid] = counts.get(uid, 0) + 1
+            else:
+                counts[uid] = counts.get(uid, 0) + raw
+        elif base.upper().startswith("CHEBI:") or base.upper().startswith("URS"):
+            continue  # non-protein, drop silently
+        else:
+            blockers.append(tok)  # set / nested-complex / EBI / unrecognized
+    all_unknown = n_subunits > 0 and n_unknown == n_subunits
+    return counts, all_unknown, blockers
+
+
+def build_cleaned_complexes_df(tsv_path: Path) -> pl.DataFrame:
+    """Read a raw ComplexPortal TSV and return a cleaned polars DataFrame.
+
+    NOTE: cleaned_complex and true_spec are BOTH derived from classify_molecules
+    (the single source of truth), so they always describe the same subunit set.
+    procompa.clean_identifiers is applied too (as a raw reference column), but the
+    orchestrator does not rely on it for the foldable set.
+
+    Output columns (added):
+      cleaned_ref            raw procompa.clean_identifiers output (reference)
+      cleaned_complex        space-joined subunit ids, one copy each
+      true_spec              curated stoichiometry "UID(n),..." ((0)->1)
+      true_spec_all_unknown  bool; True if every subunit count was unknown
+      blocker_tokens         comma-joined non-foldable tokens ('' if none)
+    """
+    df = pl.read_csv(tsv_path, separator="\t", quote_char=None, infer_schema_length=0)
+    if MOLECULES_COL not in df.columns or COMPLEX_AC_COL not in df.columns:
+        sys.exit(
+            f"[fasta] TSV missing required columns. Need '{COMPLEX_AC_COL}' and "
+            f"'{MOLECULES_COL}'. Found: {df.columns}"
+        )
+
+    # Reference-only: keep procompa's output for transparency/debugging.
+    df = clean_identifiers(df, column=MOLECULES_COL, new_column="cleaned_ref")
+
+    cleaned_complex: list[str] = []
+    true_specs: list[str] = []
+    all_unknown_flags: list[bool] = []
+    blocker_cols: list[str] = []
+    for mol in df[MOLECULES_COL].to_list():
+        counts, all_unknown, blockers = classify_molecules(mol)
+        cleaned_complex.append(" ".join(counts.keys()))
+        true_specs.append(",".join(f"{uid}({counts[uid]})" for uid in counts))
+        all_unknown_flags.append(all_unknown)
+        blocker_cols.append(",".join(blockers))
+
+    df = df.with_columns(
+        pl.Series("cleaned_complex", cleaned_complex),
+        pl.Series("true_spec", true_specs),
+        pl.Series("true_spec_all_unknown", all_unknown_flags),
+        pl.Series("blocker_tokens", blocker_cols),
+    )
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Paths / config dataclass
 # ---------------------------------------------------------------------------
 
 class Paths:
     def __init__(self, args: argparse.Namespace):
-        self.input_csv = Path(args.input_csv).resolve()
         self.out_dir = Path(args.out_dir).resolve()
+
+        # Raw ComplexPortal TSV is the new front-end input. When provided, the
+        # fasta stage derives the working CSV (cleaned_complexes.csv) from it and
+        # every downstream stage consumes that derived CSV.
+        self.input_tsv = Path(args.input_tsv).resolve() if getattr(args, "input_tsv", None) else None
+        self.cleaned_csv = self.out_dir / "cleaned_complexes.csv"
+
+        # Local UniProt sequence CSV (uniprot_id,sequence). Sole sequence source.
+        self.seq_csv = Path(args.seq_csv).resolve() if getattr(args, "seq_csv", None) else None
+
+        # Working input CSV: explicit --input-csv, else the derived cleaned CSV.
+        if getattr(args, "input_csv", None):
+            self.input_csv = Path(args.input_csv).resolve()
+        else:
+            self.input_csv = self.cleaned_csv
         self.stoic_sh = Path(args.stoic_sh).resolve() if args.stoic_sh else None
         self.combfold_sh = Path(args.combfold_sh).resolve() if args.combfold_sh else None
         self.analyze_sh = Path(args.analyze_sh).resolve() if args.analyze_sh else None
         self.this_script = Path(__file__).resolve()
 
+        # ------------------------------------------------------------------
+        # SETUP NAME: single knob for the naming of this run's output files.
+        # Change once (via --setup-name, or the SETUP_NAME default below) and
+        # every setup-tagged filename updates. E.g. "fifth_setup" ->
+        # uniprot_mapped_seq_fifth_setup.csv, fifth_setup_expanded.csv, ...
+        # ------------------------------------------------------------------
+        self.setup_name = getattr(args, "setup_name", None) or SETUP_NAME
+        s = self.setup_name
+
         # Subpaths
         self.fastas_dir = self.out_dir / "fastas"
-        self.uniprot_map_csv = self.out_dir / "uniprot_mapped_seq_second_setup.csv"
+        self.uniprot_map_csv = self.out_dir / f"uniprot_mapped_seq_{s}.csv"
         self.stoic_results_dir = self.out_dir / "stoic_results"
-        self.stoic_agg_csv = self.out_dir / "stoic_results_aggregated_second_setup.csv"
-        self.expanded_csv = self.out_dir / "second_setup_expanded.csv"
-        self.registry_json = self.out_dir / "second_setup_job_registry.json"
+        self.stoic_agg_csv = self.out_dir / f"stoic_results_aggregated_{s}.csv"
+        self.expanded_csv = self.out_dir / f"{s}_expanded.csv"
+        self.registry_json = self.out_dir / f"{s}_job_registry.json"
         self.combfold_out_base = self.out_dir / "CombFold"
         self.final_csv = self.out_dir / (
-            "all_pdb_present_second_setup_pipeline_complexes_combfold_results.csv"
+            f"all_pdb_present_{s}_pipeline_complexes_combfold_results.csv"
         )
         self.missing_stoic_log = self.out_dir / "missing_stoic_cpxs.txt"
+        self.missing_ids_log = self.out_dir / "missing_ids_complexes.txt"
+        # Persistent cache of resolved PRO-chain sub-sequences (keeps reruns
+        # offline without mutating the user's --seq-csv).
+        self.pro_cache_csv = self.out_dir / "pro_chain_sequences.csv"
 
     def ensure_dirs(self) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -143,96 +316,201 @@ def save_registry(paths: Paths, reg: dict[str, Any]) -> None:
 # Stage 1: FASTA generation (replaces 01)
 # ===========================================================================
 
-def stage_fasta(paths: Paths) -> None:
-    """Build one FASTA per #Complex ac using comb_fold_submission proteins.
+def _resolve_pro_chain(pro_token: str, timeout: int = 60) -> str | None:
+    """Resolve a processed-chain token 'ACC-PRO_NNNN' to its mature sub-sequence.
 
-    Also writes uniprot_mapped_seq_second_setup.csv (uniprot_id, sequence).
+    Queries UniProt for the parent accession, finds the feature whose featureId
+    matches 'PRO_NNNN', and slices the full-length sequence to that chain's
+    start-end coordinates. Returns None if the accession, feature, or coordinates
+    cannot be resolved. Network is used ONLY here (targeted, not bulk).
     """
-    print(f"[fasta] Reading {paths.input_csv}")
-    df = pd.read_csv(paths.input_csv)
-    if "comb_fold_submission" not in df.columns or "#Complex ac" not in df.columns:
-        sys.exit("Input CSV must have '#Complex ac' and 'comb_fold_submission' columns.")
-
-    # Collect all unique UniProt IDs across rows
-    all_ids: set[str] = set()
-    for spec in df["comb_fold_submission"]:
-        all_ids.update(parse_spec(spec).keys())
-    all_ids_list = sorted(all_ids)
-    print(f"[fasta] Total unique UniProt IDs across {len(df)} rows: {len(all_ids_list)}")
-
-    # Fetch sequences in batches of 500
-    BATCH = 500
-    sequences: dict[str, str] = {}
-
-    for i in range(0, len(all_ids_list), BATCH):
-        batch = all_ids_list[i:i + BATCH]
-        print(f"[fasta]  Batch {i // BATCH + 1}: {len(batch)} IDs...")
+    m = _PRO_TOKEN_RE.match(pro_token)
+    if not m:
+        return None
+    acc = m.group(1)
+    feature_id = f"PRO_{m.group(2)}"
+    try:
         r = requests.get(
-            "https://rest.uniprot.org/uniprotkb/stream",
-            params={
-                "query": " OR ".join(f"accession:{a}" for a in batch),
-                "format": "fasta",
-                "size": len(batch),
-            },
-            timeout=120,
+            f"https://rest.uniprot.org/uniprotkb/{acc}.json", timeout=timeout
         )
-        if r.status_code == 429:
-            time.sleep(int(r.headers.get("Retry-After", 10)))
-            r = requests.get(
-                "https://rest.uniprot.org/uniprotkb/stream",
-                params={
-                    "query": " OR ".join(f"accession:{a}" for a in batch),
-                    "format": "fasta",
-                    "size": len(batch),
-                },
-                timeout=120,
-            )
         if r.status_code != 200:
-            print(f"[fasta]  HTTP {r.status_code}, skipping batch")
+            return None
+        data = r.json()
+    except requests.RequestException:
+        return None
+    full = data.get("sequence", {}).get("value", "")
+    if not full:
+        return None
+    for feat in data.get("features", []):
+        if feat.get("featureId") == feature_id:
+            loc = feat.get("location", {})
+            start = loc.get("start", {}).get("value")
+            end = loc.get("end", {}).get("value")
+            if isinstance(start, int) and isinstance(end, int) and 1 <= start <= end <= len(full):
+                return full[start - 1:end]
+            return None
+    return None
+
+
+def _load_local_sequences(seq_csv: Path) -> dict[str, str]:
+    """Load {uniprot_id: sequence} from the local sequence CSV.
+
+    The CSV must have columns 'uniprot_id' and 'sequence'. This is the ONLY
+    sequence source (no UniProt API fallback).
+    """
+    if seq_csv is None:
+        sys.exit("[fasta] --seq-csv is required (local uniprot_id,sequence CSV).")
+    if not seq_csv.exists():
+        sys.exit(f"[fasta] sequence CSV not found: {seq_csv}")
+    sdf = pd.read_csv(seq_csv)
+    if {"uniprot_id", "sequence"} - set(sdf.columns):
+        sys.exit(f"[fasta] {seq_csv} must have 'uniprot_id' and 'sequence' columns.")
+    seqs: dict[str, str] = {}
+    for uid, seq in zip(sdf["uniprot_id"], sdf["sequence"]):
+        uid = str(uid).strip()
+        seq = str(seq).strip()
+        if uid and seq and seq.lower() != "nan":
+            seqs[uid] = seq
+    return seqs
+
+
+def stage_fasta(paths: Paths) -> None:
+    """Front-end stage: raw ComplexPortal TSV -> cleaned CSV + one FASTA per CPX.
+
+    Steps:
+      1. Read the raw TSV; apply procompa.clean_identifiers -> 'cleaned_complex'
+         (one copy per protein, CHEBI dropped) and parse the original (n)
+         counts -> 'true_spec' / 'true_spec_all_unknown'.
+      2. Write cleaned_complexes.csv (the working input CSV for downstream stages).
+      3. Load sequences from the LOCAL CSV only.
+      4. Write one FASTA per complex (one record per protein, single copy).
+         Complexes with any protein ID absent from the local CSV are SKIPPED
+         and logged to missing_ids_complexes.txt.
+      5. Write the seq->uid mapping CSV (subset actually used) for the aggregate
+         stage.
+    """
+    if paths.input_tsv is None:
+        sys.exit("[fasta] --input-tsv is required to build the cleaned complex CSV.")
+    print(f"[fasta] Reading raw ComplexPortal TSV: {paths.input_tsv}")
+
+    cleaned = build_cleaned_complexes_df(paths.input_tsv)
+    print(f"[fasta] {cleaned.height} complexes read from TSV")
+
+    # Load local sequences (sole bulk source) + any previously cached PRO chains.
+    print(f"[fasta] Loading local sequences: {paths.seq_csv}")
+    sequences = _load_local_sequences(paths.seq_csv)
+    if paths.pro_cache_csv.exists():
+        cached = _load_local_sequences(paths.pro_cache_csv)
+        sequences.update(cached)
+        print(f"[fasta] Loaded {len(cached)} cached PRO-chain sub-sequence(s)")
+    print(f"[fasta] Sequence dictionary: {len(sequences)} entries")
+
+    # Cache for resolved PRO-chain sub-sequences (avoid duplicate API calls).
+    pro_cache: dict[str, str | None] = {}
+    newly_resolved: dict[str, str] = {}
+
+    def _get_sequence(sub_id: str) -> str | None:
+        """Return sequence for a subunit id (plain accession or X-PRO_NNN).
+
+        Plain accessions come from the local CSV. PRO-chain ids are resolved via
+        a targeted UniProt call and cached (both in-run and into the local CSV).
+        """
+        if sub_id in sequences:
+            return sequences[sub_id]
+        if _PRO_TOKEN_RE.match(sub_id):
+            if sub_id not in pro_cache:
+                print(f"[fasta]   resolving PRO chain {sub_id} via UniProt...")
+                pro_cache[sub_id] = _resolve_pro_chain(sub_id)
+            seq = pro_cache[sub_id]
+            if seq:
+                sequences[sub_id] = seq
+                newly_resolved[sub_id] = seq
+            return seq
+        return None
+
+    # Decide which complexes are foldable
+    kept_rows: list[dict[str, Any]] = []
+    missing_records: list[str] = []
+    used_ids: set[str] = set()
+    n_written = 0
+
+    for row in cleaned.iter_rows(named=True):
+        cpx_id = str(row[COMPLEX_AC_COL]).strip()
+        blockers = str(row["blocker_tokens"]).strip()
+        cleaned_complex = str(row["cleaned_complex"]).strip()
+        proteins = [p for p in cleaned_complex.split() if p]
+
+        # (a) Hard blockers (paralog sets, nested complex refs, EBI ids) -> skip.
+        if blockers and blockers.lower() != "nan":
+            missing_records.append(f"{cpx_id}\tBLOCKED\t{blockers}")
+            print(f"[fasta]   [SKIP] {cpx_id}: non-foldable token(s): {blockers}")
             continue
 
-        cur_id, cur_seq = None, []
-        for line in r.text.splitlines():
-            if line.startswith(">"):
-                if cur_id:
-                    sequences[cur_id] = "".join(cur_seq)
-                cur_id = line.split("|")[1] if "|" in line else line[1:].split()[0]
-                cur_seq = []
+        # (b) No protein subunits after cleaning (RNA/small-molecule only) -> skip.
+        if not proteins:
+            missing_records.append(f"{cpx_id}\tNO_PROTEIN\t<only non-protein molecules>")
+            continue
+
+        # (c) Resolve every subunit sequence (local, or PRO-chain via API).
+        resolved: dict[str, str] = {}
+        missing: list[str] = []
+        for uid in proteins:
+            seq = _get_sequence(uid)
+            if seq is None:
+                missing.append(uid)
             else:
-                cur_seq.append(line.strip())
-        if cur_id:
-            sequences[cur_id] = "".join(cur_seq)
-        time.sleep(1)
+                resolved[uid] = seq
+        if missing:
+            missing_records.append(f"{cpx_id}\tMISSING_SEQ\t{','.join(missing)}")
+            print(f"[fasta]   [SKIP] {cpx_id}: {len(missing)} missing seq(s): {missing}")
+            continue
 
-    print(f"[fasta] Retrieved {len(sequences)}/{len(all_ids_list)} sequences")
-
-    missing_ids = [uid for uid in all_ids_list if uid not in sequences]
-    if missing_ids:
-        sys.exit(f"[fasta] FATAL: {len(missing_ids)} UniProt ID(s) returned no "
-                 f"sequence: {missing_ids[:10]}...")
-
-    # Write the seq -> uniprot mapping CSV
-    map_df = pd.DataFrame(
-        [{"uniprot_id": uid, "sequence": sequences[uid]} for uid in all_ids_list]
-    )
-    map_df.to_csv(paths.uniprot_map_csv, index=False)
-    print(f"[fasta] Wrote mapping: {paths.uniprot_map_csv}")
-
-    # Write one FASTA per CPX (single copy per protein)
-    rows = df[["#Complex ac", "comb_fold_submission"]].drop_duplicates(
-        subset="#Complex ac"
-    )
-    n_written = 0
-    for cpx_id, spec in rows.itertuples(index=False):
-        proteins = spec_to_proteins(spec)
+        # (d) Write one FASTA per complex, one record per subunit (single copy).
         fasta_path = paths.fastas_dir / f"{cpx_id}.fasta"
         with open(fasta_path, "w") as f:
             for uid in proteins:
-                seq = sequences[uid]
+                seq = resolved[uid]
+                used_ids.add(uid)
                 f.write(f">{uid}\n")
                 for j in range(0, len(seq), 80):
                     f.write(seq[j:j + 80] + "\n")
         n_written += 1
+        kept_rows.append(row)
+
+    # Persist newly resolved PRO-chain sub-sequences to a dedicated cache CSV so
+    # subsequent runs stay fully offline (the user's --seq-csv is not mutated).
+    if newly_resolved:
+        prev = (_load_local_sequences(paths.pro_cache_csv)
+                if paths.pro_cache_csv.exists() else {})
+        prev.update(newly_resolved)
+        pd.DataFrame(
+            [{"uniprot_id": k, "sequence": v} for k, v in sorted(prev.items())]
+        ).to_csv(paths.pro_cache_csv, index=False)
+        print(f"[fasta] Cached {len(newly_resolved)} PRO-chain sub-sequence(s) "
+              f"-> {paths.pro_cache_csv}")
+
+    # Persist the working CSV (only complexes that produced a FASTA)
+    kept_df = pl.DataFrame(kept_rows) if kept_rows else cleaned.head(0)
+    kept_df.write_csv(paths.cleaned_csv)
+    print(f"[fasta] Wrote working CSV ({kept_df.height} foldable complexes): "
+          f"{paths.cleaned_csv}")
+
+    # Write seq->uid mapping CSV (only the IDs actually used)
+    map_df = pd.DataFrame(
+        [{"uniprot_id": uid, "sequence": sequences[uid]} for uid in sorted(used_ids)]
+    )
+    map_df.to_csv(paths.uniprot_map_csv, index=False)
+    print(f"[fasta] Wrote mapping ({len(map_df)} proteins): {paths.uniprot_map_csv}")
+
+    # Log skipped complexes
+    if missing_records:
+        with open(paths.missing_ids_log, "w") as fh:
+            fh.write("#Complex ac\treason\tdetail\n")
+            for line in missing_records:
+                fh.write(line + "\n")
+        print(f"[fasta] Skipped {len(missing_records)} complex(es) with missing/"
+              f"non-protein IDs -> {paths.missing_ids_log}")
+
     print(f"[fasta] Wrote {n_written} FASTA files to {paths.fastas_dir}")
 
 
@@ -484,24 +762,33 @@ def stage_aggregate_stoic(paths: Paths) -> None:
 # Stage 4: Expand each input row into 10–11 stoichiometry rows
 # ===========================================================================
 
-def stage_expand(paths: Paths) -> None:
-    """Build second_setup_expanded.csv with one row per stoichiometry to run.
+def stage_expand(paths: Paths, top_n: int = 10) -> None:
+    """Build the expanded CSV with one row per stoichiometry to run.
 
-    Per input row: top-10 Stoic predictions + the true comb_fold_submission
-    if it isn't already among the top-10.
+    Per input complex: top-N Stoic predictions + the curated 'true_spec' from the
+    ComplexPortal TSV (if it isn't already among the top-N).
+
+    Each expanded row carries 'combfold_submission' = the per-row stoichiometry
+    spec ("UID(n),...") that is passed verbatim to the CombFold sbatch. For Stoic
+    predictions these are Stoic's predicted counts; for the appended true row it
+    is the curated ComplexPortal stoichiometry ((0)->1). 'stoich_prediction' is
+    kept as an alias for backward compatibility with downstream stages.
     """
     print(f"[expand] Reading {paths.input_csv}")
     df_input = pd.read_csv(paths.input_csv)
+    if "true_spec" not in df_input.columns:
+        sys.exit("[expand] input CSV missing 'true_spec' column; run --mode fasta "
+                 "against the raw TSV first.")
     print(f"[expand] Reading {paths.stoic_agg_csv}")
     df_stoic = pd.read_csv(paths.stoic_agg_csv)
     stoic_by_cpx = df_stoic.set_index("cpx_id").to_dict(orient="index")
 
     expanded_rows: list[dict[str, Any]] = []
-    MAX_PREDS = 10
+    MAX_PREDS = int(top_n)
 
     for _, row in df_input.iterrows():
         cpx_id = str(row["#Complex ac"])
-        true_spec = str(row["comb_fold_submission"])
+        true_spec = str(row["true_spec"])
         true_dict = parse_spec(true_spec)
         true_canon = canonical_spec(true_dict)
         # Preserve the protein order from the true spec for the appended-true row
@@ -532,42 +819,60 @@ def stage_expand(paths: Paths) -> None:
         for slot, prob, stoich, order in preds:
             stoich_str = dict_to_spec_str(stoich, protein_order=order)
             new_row = dict(row)
-            new_row["stoich_prediction"] = stoich_str
+            new_row["combfold_submission"] = stoich_str
+            new_row["stoich_prediction"] = stoich_str  # alias for downstream stages
             new_row["stoic_pred_rank"] = slot
             new_row["pred_score"] = prob
+            new_row["is_true_spec"] = (canonical_spec(stoich) == true_canon)
             new_row["stoic_pred_correct"] = (canonical_spec(stoich) == true_canon)
             expanded_rows.append(new_row)
 
         # Append the true row if it wasn't already among the Stoic preds
-        if true_canon not in canon_set:
+        if true_canon and true_canon not in canon_set:
+            true_str = dict_to_spec_str(true_dict, protein_order=true_order)
             new_row = dict(row)
-            new_row["stoich_prediction"] = dict_to_spec_str(true_dict, protein_order=true_order)
+            new_row["combfold_submission"] = true_str
+            new_row["stoich_prediction"] = true_str  # alias for downstream stages
             new_row["stoic_pred_rank"] = pd.NA
             new_row["pred_score"] = pd.NA
+            new_row["is_true_spec"] = True
             new_row["stoic_pred_correct"] = True
             expanded_rows.append(new_row)
 
     df_out = pd.DataFrame(expanded_rows)
     df_out.to_csv(paths.expanded_csv, index=False)
-    print(f"[expand] Wrote {len(df_out)} rows -> {paths.expanded_csv}")
-    print(f"[expand]   per-complex counts: "
-          f"{df_out['#Complex ac'].value_counts().to_dict()}")
+    print(f"[expand] Wrote {len(df_out)} rows (top_n={MAX_PREDS}) -> {paths.expanded_csv}")
+    if len(df_out):
+        print(f"[expand]   per-complex counts: "
+              f"{df_out['#Complex ac'].value_counts().to_dict()}")
 
 
 # ===========================================================================
 # Stage 5: Submit CombFold jobs
 # ===========================================================================
 
-def stage_submit_combfold(paths: Paths, dry_run: bool = False) -> list[int]:
-    """Submit one CombFold sbatch per unique stoich_prediction."""
+def stage_submit_combfold(
+    paths: Paths, dry_run: bool = False, source: str = "pool"
+) -> list[int]:
+    """Submit one CombFold sbatch per unique combfold_submission spec.
+
+    The s2 CombFold sbatch takes TWO positional args: the spec and SOURCE
+    ('pair' or 'pool'). Every job is submitted with the given `source`
+    (default 'pool').
+    """
     if paths.combfold_sh is None or not paths.combfold_sh.exists():
         sys.exit("[submit-combfold] --combfold-sh path does not exist.")
+    if source not in ("pair", "pool"):
+        sys.exit(f"[submit-combfold] source must be 'pair' or 'pool', got '{source}'.")
 
     print(f"[submit-combfold] Reading {paths.expanded_csv}")
     df = pd.read_csv(paths.expanded_csv)
 
-    unique_specs = list(dict.fromkeys(df["stoich_prediction"].astype(str)))
-    print(f"[submit-combfold] {len(df)} rows -> {len(unique_specs)} unique specs")
+    # Prefer combfold_submission; fall back to stoich_prediction alias.
+    spec_col = "combfold_submission" if "combfold_submission" in df.columns else "stoich_prediction"
+    unique_specs = list(dict.fromkeys(df[spec_col].astype(str)))
+    print(f"[submit-combfold] {len(df)} rows -> {len(unique_specs)} unique specs "
+          f"(source={source})")
 
     # Patch the combfold sbatch so OUTPUT_BASE points at second_setup/CombFold
     patched_sh = _patch_combfold_sbatch(paths)
@@ -576,7 +881,7 @@ def stage_submit_combfold(paths: Paths, dry_run: bool = False) -> list[int]:
     spec_to_job: dict[str, int | None] = {}
     submitted_ids: list[int] = []
     for spec in unique_specs:
-        cmd = ["sbatch", str(patched_sh), spec]
+        cmd = ["sbatch", str(patched_sh), spec, source]
         if dry_run:
             print(f"[DRY-RUN] {' '.join(cmd)}")
             spec_to_job[spec] = None
@@ -596,12 +901,14 @@ def stage_submit_combfold(paths: Paths, dry_run: bool = False) -> list[int]:
     # Record per-row registry entries
     rows_reg: list[dict[str, Any]] = []
     for csv_row, row in df.iterrows():
-        spec = str(row["stoich_prediction"])
+        spec = str(row[spec_col])
         rows_reg.append({
             "csv_row": int(csv_row),
             "cpx_id": str(row.get("#Complex ac", "")),
+            "combfold_submission": spec,
             "stoich_prediction": spec,
             "complex_name": spec_to_complex_name(spec),
+            "source": source,
             "slurm_job_id": spec_to_job.get(spec),
         })
 
@@ -655,7 +962,9 @@ def stage_submit_analyze_dependency(paths: Paths, job_ids: list[int]) -> None:
 # Stage 7: Submit Stoic dependency chain (aggregate -> expand -> combfold -> analyze)
 # ===========================================================================
 
-def stage_submit_post_stoic_chain(paths: Paths, stoic_job_id: int) -> None:
+def stage_submit_post_stoic_chain(
+    paths: Paths, stoic_job_id: int, top_n: int = 10, source: str = "pool"
+) -> None:
     """Submit a single sbatch (--dependency=afterok:stoic_job_id) that runs
     aggregate-stoic + expand + submit-combfold + (submit-analyze dependency).
 
@@ -669,16 +978,16 @@ def stage_submit_post_stoic_chain(paths: Paths, stoic_job_id: int) -> None:
         f"#SBATCH --job-name=post_stoic_chain\n"
         f"#SBATCH --output={paths.out_dir}/logs/post_stoic_chain_%j.out\n"
         f"#SBATCH --error={paths.out_dir}/logs/post_stoic_chain_%j.err\n"
-        f"#SBATCH --time=01:00:00\n"
-        f"#SBATCH --cpus-per-task=2\n"
-        f"#SBATCH --mem-per-cpu=8G\n"
         f"set -euo pipefail\n"
         f"mkdir -p {paths.out_dir}/logs\n"
         f"python {paths.this_script} \\\n"
         f"    --input-csv {paths.input_csv} \\\n"
         f"    --out-dir {paths.out_dir} \\\n"
+        f"    --setup-name {paths.setup_name} \\\n"
         f"    --combfold-sh {paths.combfold_sh} \\\n"
         f"    --analyze-sh {paths.analyze_sh} \\\n"
+        f"    --top-n {top_n} \\\n"
+        f"    --combfold-source {source} \\\n"
         f"    --mode post-stoic-chain\n"
     )
     chain_sh.chmod(0o755)
@@ -781,14 +1090,32 @@ def stage_analyze(paths: Paths) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input-csv", required=True, type=Path)
+    ap.add_argument("--input-tsv", type=Path, default=None,
+                    help="Raw ComplexPortal TSV (front-end input for --mode "
+                         "fasta/all). Required unless --input-csv is given.")
+    ap.add_argument("--input-csv", type=Path, default=None,
+                    help="Pre-built working CSV (skips TSV cleaning). If omitted, "
+                         "the derived <out-dir>/cleaned_complexes.csv is used.")
+    ap.add_argument("--seq-csv", type=Path, default=None,
+                    help="Local uniprot_id,sequence CSV (sole sequence source; "
+                         "required for --mode fasta/all).")
     ap.add_argument("--out-dir", required=True, type=Path)
+    ap.add_argument("--setup-name", type=str, default=SETUP_NAME,
+                    help=f"Single label interpolated into every setup-tagged "
+                         f"output filename (default {SETUP_NAME!r}). Change this "
+                         f"one flag instead of editing individual paths.")
     ap.add_argument("--stoic-sh", type=Path, default=None,
                     help="Path to 03_run_stoic.sbatch (required for submit-stoic/all)")
     ap.add_argument("--combfold-sh", type=Path, default=None,
                     help="Path to 05_run_CombFold.sbatch (required for submit-combfold/all)")
     ap.add_argument("--analyze-sh", type=Path, default=None,
                     help="Path to 11_analyze.sbatch (required for all/post-stoic-chain)")
+    ap.add_argument("--top-n", type=int, default=10,
+                    help="Number of Stoic predictions per complex to expand into "
+                         "CombFold jobs (default 10; the curated true_spec is "
+                         "always added if not already present).")
+    ap.add_argument("--combfold-source", choices=["pair", "pool"], default="pool",
+                    help="SOURCE arg passed to the CombFold sbatch (default pool).")
     ap.add_argument(
         "--mode",
         choices=[
@@ -807,6 +1134,14 @@ def main() -> None:
     paths.ensure_dirs()
 
     # --- Mode-specific required-arg checks ----------------------------------
+    if args.mode in ("fasta", "all") and not args.input_tsv:
+        sys.exit(f"--mode {args.mode} requires --input-tsv (raw ComplexPortal TSV)")
+    if args.mode in ("fasta", "all") and not args.seq_csv:
+        sys.exit(f"--mode {args.mode} requires --seq-csv (local sequence CSV)")
+    if args.mode in ("aggregate-stoic", "expand", "submit-combfold", "analyze",
+                     "post-stoic-chain") and not (args.input_csv or paths.cleaned_csv.exists()):
+        sys.exit(f"--mode {args.mode} requires --input-csv or an existing "
+                 f"{paths.cleaned_csv} (run --mode fasta first)")
     if args.mode in ("submit-stoic", "all") and not args.stoic_sh:
         sys.exit(f"--mode {args.mode} requires --stoic-sh")
     if args.mode in ("submit-combfold", "post-stoic-chain", "all") and not args.combfold_sh:
@@ -828,12 +1163,13 @@ def main() -> None:
         stage_aggregate_stoic(paths)
 
     elif args.mode == "expand":
-        stage_expand(paths)
+        stage_expand(paths, top_n=args.top_n)
 
     elif args.mode == "submit-combfold":
         if not paths.expanded_csv.exists():
             sys.exit("[submit-combfold] expanded.csv missing; run --mode expand first.")
-        ids = stage_submit_combfold(paths, dry_run=args.dry_run)
+        ids = stage_submit_combfold(paths, dry_run=args.dry_run,
+                                    source=args.combfold_source)
         if args.analyze_sh and not args.dry_run:
             stage_submit_analyze_dependency(paths, ids)
 
@@ -843,8 +1179,8 @@ def main() -> None:
     elif args.mode == "post-stoic-chain":
         # Internal: this is what the dependency sbatch runs after Stoic finishes.
         stage_aggregate_stoic(paths)
-        stage_expand(paths)
-        ids = stage_submit_combfold(paths)
+        stage_expand(paths, top_n=args.top_n)
+        ids = stage_submit_combfold(paths, source=args.combfold_source)
         if args.analyze_sh:
             stage_submit_analyze_dependency(paths, ids)
 
@@ -856,7 +1192,8 @@ def main() -> None:
         stoic_jid = reg.get("stoic_job_id")
         if not stoic_jid:
             sys.exit("[all] No stoic_job_id in registry; cannot chain.")
-        stage_submit_post_stoic_chain(paths, stoic_jid)
+        stage_submit_post_stoic_chain(paths, stoic_jid, top_n=args.top_n,
+                                      source=args.combfold_source)
         print(f"\n[all] Submitted Stoic job {stoic_jid} and dependent chain. "
               f"Monitor with squeue; final CSV will appear at:\n  {paths.final_csv}")
 

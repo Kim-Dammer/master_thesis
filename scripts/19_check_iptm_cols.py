@@ -1,6 +1,6 @@
 import pooled_ppi
 
-DB = "/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.04"
+DB = "/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.07"
 print("Loading DB from " + DB + " ...")
 pp = pooled_ppi.PooledPredictionsDb(DB)
 

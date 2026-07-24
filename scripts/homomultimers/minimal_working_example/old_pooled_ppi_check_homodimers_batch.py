@@ -12,7 +12,7 @@ Usage:
     python check_homodimers_batch.py --from-file my_proteins.txt
 
     # save full per-protein table to CSV
-    python check_homodimers_batch.py --from-file my_proteins.txt --out coverage.csv
+    uv run check_homodimers_batch.py --from-file /cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/all_CP_proteins.csv --out coverage.csv
 
 Efficiency: ONE parquet scan (predicate-pushed to self-pairs of the requested
 proteins) + ONE foldcomp.open (all keys across all proteins batched). Runs in

@@ -23,6 +23,9 @@ scripts/homomultimers/minimal_working_example/*.pdb
 scripts/homomultimers/minimal_working_example/logs
 scripts/homomultimers/logs
 
+
+scripts/helper_scripts/logs
+
 scripts/slurm_logs
 scripts/homomultimers/logs
 
