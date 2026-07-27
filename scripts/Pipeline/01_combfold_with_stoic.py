@@ -6,9 +6,9 @@ rm -r /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/5_fifth_setup
 ===========================
 uv run 01_combfold_with_stoic.py \
         --mode all \
-        --input-tsv  /cluster/project/beltrao/kdammer/master_thesis/data/Complex_Portal/Saccharomyces_cerevisiae_ComplexTab.tsv\
+        --input-tsv  /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/CF_test/random_subset_Saccharomyces_cerevisiae_ComplexTab.tsv\
         --seq-csv    /cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/all_yeast_proteins_uniprot_mapped_sequences.csv \
-        --out-dir    /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/5_fifth_setup_all_CP\
+        --out-dir    /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/CF_test\
         --stoic-sh   s1_run_stoic.sbatch \
         --combfold-sh s2_run_CombFold.sbatch \
         --analyze-sh s3_analyze_CF_results.sbatch \
@@ -91,12 +91,21 @@ _ENTRY_RE = re.compile(r"^([A-Za-z0-9_]+)\((\d+)\)$")
 
 
 def parse_spec(spec: str) -> dict[str, int]:
-    """Parse 'P00937(1),P00899(2)' -> {'P00937': 1, 'P00899': 2}."""
+    """Parse 'P00937(1),P00899(2)' -> {'P00937': 1, 'P00899': 2}.
+
+    A non-empty token that does not match _ENTRY_RE is still skipped (behavior
+    unchanged), but a one-line warning is emitted so silent drops become
+    visible — e.g. a '-PRO_' id or a formatting glitch that slipped into a spec
+    string would otherwise vanish without trace.
+    """
     counts: dict[str, int] = {}
     for tok in [t.strip() for t in str(spec).split(",") if t.strip()]:
         m = _ENTRY_RE.match(tok)
         if m:
             counts[m.group(1)] = int(m.group(2))
+        else:
+            print(f"[parse_spec] WARNING: unparseable token skipped: {tok!r} "
+                  f"(in spec {str(spec)!r})", file=sys.stderr)
     return counts
 
 
@@ -154,8 +163,12 @@ def classify_molecules(molecules: str) -> tuple[dict[str, int], bool, list[str]]
     Input example: "P32797(0)|P38960(0)|CHEBI:49601(0)|Q07921(0)"
 
     Rules:
-      * Keep plain UniProt accessions and processed-chain ids (X-PRO_NNN) as
-        foldable subunits. "(0)" (unknown) -> count 1; positive count kept as-is.
+      * Keep plain UniProt accessions as foldable subunits. "(0)" (unknown) ->
+        count 1; positive count kept as-is.
+      * Processed-chain ids (X-PRO_NNN) are TEMPORARILY treated as blockers, so
+        any complex containing one is skipped end-to-end (see note in body). The
+        pairwise foldcomp DBs are keyed on plain full-length accessions, so a
+        mature PRO sub-sequence has no residue-consistent pairwise structure.
       * Silently drop CHEBI and URS (RNAcentral) tokens.
       * Any OTHER token type (paralog sets '[A,B]', nested complex refs 'CPX-...',
         'EBI-...', etc.) is treated as a hard blocker: the whole complex must be
@@ -176,6 +189,17 @@ def classify_molecules(molecules: str) -> tuple[dict[str, int], bool, list[str]]
         m = _SUBUNIT_RE.match(tok)
         if m:
             uid = m.group(1)
+            # TEMPORARY EXCLUSION: processed-chain ids (X-PRO_NNN) are dropped
+            # end-to-end for now. STOIC folds the resolved mature sub-sequence,
+            # but the pairwise foldcomp DBs are keyed on plain full-length
+            # accessions (predicted on full-length seqs), so the mature
+            # sub-sequence has no residue-consistent pairwise structure. Rather
+            # than assemble an inconsistent complex, skip the WHOLE complex and
+            # log it. Route the PRO token to blockers so stage_fasta's existing
+            # skip+log path handles it (reason BLOCKED, detail = the PRO token).
+            if _PRO_TOKEN_RE.match(uid):
+                blockers.append(tok)
+                continue
             raw = int(m.group(2))
             n_subunits += 1
             if raw == 0:
@@ -518,16 +542,21 @@ def stage_fasta(paths: Paths) -> None:
 # Stage 2: Stoic submission (single sbatch, env-var overrides)
 # ===========================================================================
 
-def stage_submit_stoic(paths: Paths) -> None:
-    """Submit the single Stoic GPU sbatch with env-var overrides for I/O paths."""
+def stage_submit_stoic(paths: Paths, top_n: int = 10) -> None:
+    """Submit the single Stoic GPU sbatch with env-var overrides for I/O paths.
+
+    `top_n` is patched into the sbatch's 'stoic_predict_stoichiometry --top-n N'
+    so STOIC generates exactly the number of predictions that will be expanded
+    to CombFold (single source of truth).
+    """
     if paths.stoic_sh is None or not paths.stoic_sh.exists():
         sys.exit("[submit-stoic] --stoic-sh path does not exist.")
 
-    print(f"[submit-stoic] Submitting {paths.stoic_sh}")
+    print(f"[submit-stoic] Submitting {paths.stoic_sh} (top_n={top_n})")
 
     # Pass FASTA / output via env vars; the sbatch script needs to honour these.
     # If the user's existing sbatch hardcodes paths, we sed-patch a temp copy.
-    patched_sh = _patch_stoic_sbatch(paths)
+    patched_sh = _patch_stoic_sbatch(paths, top_n)
 
     env = os.environ.copy()
     env["SECOND_SETUP_FASTA_DIR"] = str(paths.fastas_dir)
@@ -592,12 +621,14 @@ def _patch_combfold_sbatch(paths: Paths) -> Path:
     return patched_path
 
 
-def _patch_stoic_sbatch(paths: Paths) -> Path:
+def _patch_stoic_sbatch(paths: Paths, top_n: int) -> Path:
     """Write a patched copy of the user's stoic sbatch that points at second_setup.
 
-    The user's existing sbatch hardcodes FASTA_DIR / OUTPUT_DIR; replace them
-    with second-setup paths. Also redirect SBATCH log paths to second_setup/logs/
-    so the job can run from any CWD.
+    The user's existing sbatch hardcodes FASTA_DIR / OUTPUT_DIR and '--top-n N';
+    replace them with the second-setup paths and the orchestrator's --top-n so
+    STOIC generates exactly as many predictions as will be expanded to CombFold.
+    Also redirect SBATCH log paths to second_setup/logs/ so the job can run from
+    any CWD.
     """
     text = paths.stoic_sh.read_text()
     logs_dir = paths.out_dir / "logs"
@@ -613,6 +644,14 @@ def _patch_stoic_sbatch(paths: Paths) -> Path:
         r'^OUTPUT_DIR=.*$',
         f'OUTPUT_DIR="{paths.stoic_results_dir}"',
         text, count=1, flags=re.MULTILINE,
+    )
+    # Wire STOIC's --top-n to the orchestrator's --top-n (single source of truth,
+    # so STOIC-generated == expanded-to-CombFold). Matches '--top-n 10' or
+    # '--top-n=10'. count=0 replaces every occurrence.
+    text, n_topn = re.subn(
+        r'--top-n(\s+|=)\d+',
+        f'--top-n {top_n}',
+        text,
     )
     # Redirect SBATCH --output / --error to absolute logs_dir paths.
     text = re.sub(
@@ -636,6 +675,15 @@ def _patch_stoic_sbatch(paths: Paths) -> Path:
         sys.exit(f"[stoic-patch] FASTA_DIR/OUTPUT_DIR substitution failed in "
                  f"{paths.stoic_sh}. Expected 'FASTA_DIR=' and 'OUTPUT_DIR=' "
                  f"lines.")
+    # Verify the --top-n patch took effect (fail loud rather than let STOIC and
+    # the expand stage silently disagree on prediction count).
+    if n_topn == 0:
+        sys.exit(f"[stoic-patch] no '--top-n N' found to patch in {paths.stoic_sh}. "
+                 f"Expected a 'stoic_predict_stoichiometry ... --top-n N' line.")
+    if f"--top-n {top_n}" not in pt:
+        sys.exit(f"[stoic-patch] '--top-n {top_n}' substitution failed in "
+                 f"{paths.stoic_sh}.")
+    print(f"[stoic-patch] patched --top-n -> {top_n} ({n_topn} occurrence(s))")
     return patched_path
 
 
@@ -646,50 +694,121 @@ def _patch_stoic_sbatch(paths: Paths) -> Path:
 PREDICTION_META_KEYS = {"rank", "probability"}
 
 
-def _load_seq_to_uniprot(path: Path) -> dict[str, str]:
+class StoicMappingError(Exception):
+    """One complex could not be mapped back from STOIC sequences to UniProt IDs.
+
+    Raised (instead of aborting the whole batch) so stage_aggregate_stoic can
+    skip + log just the offending complex and keep processing the rest.
+    """
+
+
+def _load_seq_to_uniprot(path: Path) -> dict[str, set[str]]:
+    """Load the sequence -> {uniprot_id, ...} map from the mapping CSV.
+
+    A single sequence can map to MORE THAN ONE UniProt ID: in yeast, whole-
+    genome-duplication paralog pairs (e.g. histone HTA1/HTA2, HHF1/HHF2, several
+    ribosomal-protein gene pairs) are 100% identical at the protein level. We
+    therefore keep the FULL set of candidate IDs per sequence and warn (rather
+    than abort). The per-complex resolution in _parse_one_stoic_pred then
+    disambiguates using the complex's own expected ID set; only a collision
+    WITHIN a single complex is genuinely unresolvable.
+    """
     df = pd.read_csv(path)
     if {"uniprot_id", "sequence"} - set(df.columns):
         sys.exit(f"{path} missing 'uniprot_id' or 'sequence' column.")
-    mapping: dict[str, str] = {}
+    mapping: dict[str, set[str]] = {}
     for _, row in df.iterrows():
         seq = str(row["sequence"]).strip()
         uid = str(row["uniprot_id"]).strip()
-        if not seq or not uid:
+        if not seq or not uid or seq.lower() == "nan":
             continue
-        if seq in mapping and mapping[seq] != uid:
-            sys.exit(f"Duplicate sequence -> {mapping[seq]} and {uid}")
-        mapping[seq] = uid
+        mapping.setdefault(seq, set()).add(uid)
+    n_shared = sum(1 for uids in mapping.values() if len(uids) > 1)
+    if n_shared:
+        shared = {s[:20] + "...": sorted(u) for s, u in mapping.items() if len(u) > 1}
+        print(f"[aggregate-stoic] NOTE: {n_shared} sequence(s) shared by >1 "
+              f"UniProt ID (identical paralogs). Resolved per-complex where "
+              f"possible: {shared}")
     return mapping
 
 
 def _parse_one_stoic_pred(
     entry: dict[str, Any],
-    seq_to_uid: dict[str, str],
+    seq_to_uid: dict[str, set[str]],
     cpx_id: str,
     idx: int,
-) -> tuple[float, int, dict[str, int], list[str]]:
-    """Return (probability, rank, {uid: count}, protein_order_as_returned)."""
-    if "probability" not in entry or "rank" not in entry:
-        sys.exit(f"[{cpx_id}] pred {idx} missing rank/probability")
+    expected_uids: set[str],
+) -> tuple[float, int | None, dict[str, int], list[str]]:
+    """Return (probability, n_copies, {uid: count}, protein_order_as_returned).
+
+    Resolution rule for each sequence key:
+      * candidates = seq_to_uid[seq]  (may be >1 for identical paralogs)
+      * intersect with `expected_uids` (this complex's own subunit IDs) to
+        disambiguate. Exactly one survivor -> use it.
+      * zero survivors (or seq missing entirely) -> unmappable -> raise.
+      * >1 survivor (two identical-sequence paralogs BOTH in this complex) ->
+        genuinely ambiguous -> raise. The caller skips + logs the complex.
+
+    Raises StoicMappingError instead of aborting the batch.
+
+    NOTE: stoic's raw "rank" field is NOT an ordinal rank; it is the total
+    subunit copy number. It is informational only (not used to build the spec),
+    so it is treated as OPTIONAL here (see bug #9): probability is the only hard
+    requirement.
+    """
+    if "probability" not in entry:
+        raise StoicMappingError(f"[{cpx_id}] pred {idx} missing 'probability'")
     prob = float(entry["probability"])
-    rank = int(entry["rank"])
+    # rank/n_copies is optional + informational; degrade to None on any problem.
+    try:
+        n_copies: int | None = int(entry["rank"]) if "rank" in entry else None
+    except (TypeError, ValueError):
+        n_copies = None
+
     stoich: dict[str, int] = {}
     order: list[str] = []
     for key, value in entry.items():
         if key in PREDICTION_META_KEYS:
             continue
         seq = str(key)
-        if seq not in seq_to_uid:
-            sys.exit(f"[{cpx_id}] pred {idx}: sequence not in mapping "
-                     f"(first 60 chars): {seq[:60]!r}")
-        uid = seq_to_uid[seq]
+        candidates = seq_to_uid.get(seq)
+        if not candidates:
+            raise StoicMappingError(
+                f"[{cpx_id}] pred {idx}: sequence not in mapping "
+                f"(first 60 chars): {seq[:60]!r}"
+            )
+        resolved = candidates & expected_uids
+        if len(resolved) == 1:
+            uid = next(iter(resolved))
+        elif len(resolved) == 0:
+            # Sequence maps to IDs, but none are expected in THIS complex.
+            if len(candidates) == 1:
+                uid = next(iter(candidates))  # unambiguous globally; trust it
+            else:
+                raise StoicMappingError(
+                    f"[{cpx_id}] pred {idx}: sequence maps to {sorted(candidates)} "
+                    f"but none are in this complex's expected set "
+                    f"{sorted(expected_uids)}"
+                )
+        else:
+            # >1 identical-sequence paralog present IN this complex -> cannot
+            # tell which count belongs to which ID from sequence alone.
+            raise StoicMappingError(
+                f"[{cpx_id}] pred {idx}: ambiguous — sequence maps to "
+                f"{sorted(resolved)}, both present in this complex"
+            )
         stoich[uid] = int(value)
         order.append(uid)
-    return prob, rank, stoich, order
+    return prob, n_copies, stoich, order
 
 
-def stage_aggregate_stoic(paths: Paths) -> None:
+def stage_aggregate_stoic(paths: Paths, max_preds: int = 10) -> None:
     """Read stoic_results/CPX-*/results.json; emit aggregated CSV.
+
+    `max_preds` (= the orchestrator's --top-n) caps how many predictions per
+    complex are stored as pred_1..pred_N columns; it is threaded from --top-n so
+    aggregate, STOIC generation, and expand all agree. Fewer are stored if STOIC
+    returned fewer.
 
     Missing folders are logged to missing_stoic_cpxs.txt and skipped.
     """
@@ -700,9 +819,20 @@ def stage_aggregate_stoic(paths: Paths) -> None:
     cpx_ids_in_csv = df_input["#Complex ac"].dropna().astype(str).unique().tolist()
     print(f"[aggregate-stoic] Expecting {len(cpx_ids_in_csv)} CPX folders")
 
+    # Per-complex expected UniProt IDs (from the cleaned foldable set) used to
+    # disambiguate identical-sequence paralogs during mapping.
+    expected_by_cpx: dict[str, set[str]] = {}
+    if "cleaned_complex" in df_input.columns:
+        for _, r in df_input.iterrows():
+            cid = str(r["#Complex ac"]).strip()
+            expected_by_cpx[cid] = {
+                p for p in str(r["cleaned_complex"]).split() if p
+            }
+
     rows: list[dict[str, Any]] = []
-    missing: list[str] = []
-    MAX_PREDS = 10
+    missing: list[str] = []       # missing/empty results.json
+    unmappable: list[str] = []    # results present but couldn't map to UniProt
+    MAX_PREDS = int(max_preds)
 
     for cpx_id in cpx_ids_in_csv:
         folder = paths.stoic_results_dir / cpx_id
@@ -718,9 +848,20 @@ def stage_aggregate_stoic(paths: Paths) -> None:
             print(f"[aggregate-stoic]   [WARN] {cpx_id}: empty results.json")
             continue
 
-        parsed: list[tuple[float, int, dict[str, int], list[str]]] = []
-        for i, entry in enumerate(data):
-            parsed.append(_parse_one_stoic_pred(entry, seq_to_uid, cpx_id, i))
+        expected_uids = expected_by_cpx.get(cpx_id, set())
+        # Map every prediction for this complex; on ANY mapping failure, skip the
+        # WHOLE complex (partial predictions would give inconsistent specs) and
+        # log why — but keep processing all other complexes.
+        try:
+            parsed: list[tuple[float, int | None, dict[str, int], list[str]]] = []
+            for i, entry in enumerate(data):
+                parsed.append(
+                    _parse_one_stoic_pred(entry, seq_to_uid, cpx_id, i, expected_uids)
+                )
+        except StoicMappingError as e:
+            unmappable.append(f"{cpx_id}\t{e}")
+            print(f"[aggregate-stoic]   [SKIP] {e}")
+            continue
         # Sort by probability descending
         parsed.sort(key=lambda t: t[0], reverse=True)
         kept = parsed[:MAX_PREDS]
@@ -731,12 +872,12 @@ def stage_aggregate_stoic(paths: Paths) -> None:
         }
         for slot in range(1, MAX_PREDS + 1):
             if slot <= len(kept):
-                prob, rank, stoich, order = kept[slot - 1]
+                prob, n_copies, stoich, order = kept[slot - 1]
                 row[f"pred_{slot}_stoichiometry"] = json.dumps(
                     stoich, sort_keys=True, separators=(",", ":")
                 )
                 row[f"pred_{slot}_score"] = json.dumps(
-                    {"rank": rank, "probability": prob},
+                    {"rank": slot, "n_copies": n_copies, "probability": prob},
                     separators=(",", ":"),
                 )
                 row[f"pred_{slot}_protein_order"] = json.dumps(order)
@@ -753,9 +894,19 @@ def stage_aggregate_stoic(paths: Paths) -> None:
         print(f"[aggregate-stoic] Wrote {len(missing)} missing CPX(s) to "
               f"{paths.missing_stoic_log}")
 
+    if unmappable:
+        unmappable_log = paths.out_dir / "unmappable_stoic_cpxs.txt"
+        with open(unmappable_log, "w") as fh:
+            fh.write("#Complex ac\treason\n")
+            for line in unmappable:
+                fh.write(line + "\n")
+        print(f"[aggregate-stoic] Wrote {len(unmappable)} unmappable/ambiguous "
+              f"CPX(s) to {unmappable_log}")
+
     out_df = pd.DataFrame(rows)
     out_df.to_csv(paths.stoic_agg_csv, index=False)
-    print(f"[aggregate-stoic] Wrote {len(rows)} rows -> {paths.stoic_agg_csv}")
+    print(f"[aggregate-stoic] Wrote {len(rows)} rows -> {paths.stoic_agg_csv} "
+          f"({len(missing)} missing, {len(unmappable)} unmappable skipped)")
 
 
 # ===========================================================================
@@ -836,7 +987,13 @@ def stage_expand(paths: Paths, top_n: int = 10) -> None:
             new_row["stoic_pred_rank"] = pd.NA
             new_row["pred_score"] = pd.NA
             new_row["is_true_spec"] = True
-            new_row["stoic_pred_correct"] = True
+            # This row is a SYNTHETIC ground-truth row appended precisely because
+            # STOIC did NOT predict the true spec (stoic_pred_rank is NA). It must
+            # NOT count as a correct STOIC prediction, or accuracy computed as
+            # mean(stoic_pred_correct) is inflated on exactly the complexes STOIC
+            # got wrong. is_true_spec stays True (it genuinely is ground truth);
+            # stoic_pred_correct answers "did STOIC predict this?" -> False here.
+            new_row["stoic_pred_correct"] = False
             expanded_rows.append(new_row)
 
     df_out = pd.DataFrame(expanded_rows)
@@ -1031,10 +1188,25 @@ def _parse_confidence_txt(conf_path: Path) -> dict[int, float]:
     return scores
 
 
-def stage_analyze(paths: Paths) -> None:
-    """Parse CombFold outputs and write the final enriched CSV."""
-    print(f"[analyze] Reading {paths.expanded_csv}")
+def stage_analyze(paths: Paths, source: str = "pool") -> None:
+    """Parse CombFold outputs and write the final enriched CSV.
+
+    `source` MUST match the SOURCE ('pair'/'pool') the CombFold jobs were
+    submitted with: s2 writes results to '<complex_name>_<source>_output/', so
+    the reader has to reconstruct the same source-suffixed dir. Without it every
+    row falsely reports combfold_successfully=False / empty confidence.
+    """
+    if source not in ("pair", "pool"):
+        sys.exit(f"[analyze] source must be 'pair' or 'pool', got '{source}'.")
+    print(f"[analyze] Reading {paths.expanded_csv} (source={source})")
     df = pd.read_csv(paths.expanded_csv)
+
+    # Read the SAME column stage_submit_combfold submitted from: prefer
+    # 'combfold_submission', fall back to the 'stoich_prediction' alias. If they
+    # ever diverge, keying analyze off the alias would look in a different dir
+    # than the one CombFold actually wrote.
+    spec_col = "combfold_submission" if "combfold_submission" in df.columns else "stoich_prediction"
+    print(f"[analyze] Using spec column: {spec_col}")
 
     col_success: list[bool] = []
     col_n_outputs: list[int] = []
@@ -1043,13 +1215,14 @@ def stage_analyze(paths: Paths) -> None:
     cache: dict[str, dict[str, Any]] = {}
 
     for idx, row in df.iterrows():
-        spec = str(row["stoich_prediction"])
+        spec = str(row[spec_col])
         complex_name = spec_to_complex_name(spec)
+        run_name = f"{complex_name}_{source}"  # match s2's RUN_NAME
 
-        if complex_name in cache:
-            c = cache[complex_name]
+        if run_name in cache:
+            c = cache[run_name]
         else:
-            output_dir = paths.combfold_out_base / f"{complex_name}_output"
+            output_dir = paths.combfold_out_base / f"{run_name}_output"
             assembled = output_dir / "assembled_results"
             if assembled.exists():
                 pdbs = sorted(assembled.glob("output_clustered_*.pdb"))
@@ -1067,8 +1240,8 @@ def stage_analyze(paths: Paths) -> None:
                 "n_outputs": n_outputs,
                 "confidence_str": confidence_str,
             }
-            cache[complex_name] = c
-            print(f"[analyze]   row {idx}: {complex_name} -> "
+            cache[run_name] = c
+            print(f"[analyze]   row {idx}: {run_name} -> "
                   f"success={c['success']}, n={c['n_outputs']}")
 
         col_success.append(c["success"])
@@ -1157,10 +1330,10 @@ def main() -> None:
     elif args.mode == "submit-stoic":
         if not paths.fastas_dir.exists() or not any(paths.fastas_dir.iterdir()):
             sys.exit("[submit-stoic] fastas/ is empty; run --mode fasta first.")
-        stage_submit_stoic(paths)
+        stage_submit_stoic(paths, top_n=args.top_n)
 
     elif args.mode == "aggregate-stoic":
-        stage_aggregate_stoic(paths)
+        stage_aggregate_stoic(paths, max_preds=args.top_n)
 
     elif args.mode == "expand":
         stage_expand(paths, top_n=args.top_n)
@@ -1174,11 +1347,11 @@ def main() -> None:
             stage_submit_analyze_dependency(paths, ids)
 
     elif args.mode == "analyze":
-        stage_analyze(paths)
+        stage_analyze(paths, source=args.combfold_source)
 
     elif args.mode == "post-stoic-chain":
         # Internal: this is what the dependency sbatch runs after Stoic finishes.
-        stage_aggregate_stoic(paths)
+        stage_aggregate_stoic(paths, max_preds=args.top_n)
         stage_expand(paths, top_n=args.top_n)
         ids = stage_submit_combfold(paths, source=args.combfold_source)
         if args.analyze_sh:
@@ -1187,7 +1360,7 @@ def main() -> None:
     elif args.mode == "all":
         # Full end-to-end via sbatch dependencies (no blocking polling).
         stage_fasta(paths)
-        stage_submit_stoic(paths)
+        stage_submit_stoic(paths, top_n=args.top_n)
         reg = load_registry(paths)
         stoic_jid = reg.get("stoic_job_id")
         if not stoic_jid:

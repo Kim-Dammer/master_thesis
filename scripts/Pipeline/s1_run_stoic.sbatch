@@ -30,7 +30,7 @@ mkdir -p "$OUTPUT_DIR"
 echo "Reading from: ${FASTA_DIR}"
 echo "Saving to: ${OUTPUT_DIR}"
 
-TOTAL_FILES=$(ls -1 "$FASTA_DIR"/*.fasta | wc -l)
+TOTAL_FILES=$(ls -1 "$FASTA_DIR"/*.fasta | wc -l)  #fasta files if not present can be created with the helper script 01_create_fasta_files_for_stoic.py
 CURRENT_FILE=0
 
 for FASTA_FILE in "$FASTA_DIR"/*.fasta; do

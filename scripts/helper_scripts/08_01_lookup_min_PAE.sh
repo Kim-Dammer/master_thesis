@@ -61,6 +61,7 @@ DB_ID2 = "af3_id2"
 # Nested-list value columns to fetch
 VALUE_COLUMNS = [
     "input_type",  # String
+    "input_name",  # String
     "seed",  # Int64
     "sample",  # Int64
     "chain_pair_pae_min_min",  # Float64

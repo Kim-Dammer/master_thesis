@@ -9,6 +9,7 @@ dependencies = [
     "brokenaxes>=0.6.2",
     "dash>=4.4.1",
     "dash-molstar>=1.4.0",
+    "duckdb>=1.5.5",
     "fastparquet>=2026.5.0",
     "hmmer>=3.4.0.2",
     "ipykernel>=7.2.0",
