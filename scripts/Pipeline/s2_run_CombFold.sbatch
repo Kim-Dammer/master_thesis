@@ -6,7 +6,7 @@
 #SBATCH --error=logs/combfold_%j.err
 #SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=5
-#SBATCH --mem-per-cpu=5G
+#SBATCH --mem-per-cpu=7G
 #SBATCH --gpus=1
 
 # ============================================================
@@ -21,27 +21,36 @@
 # optional trailing ratio (e.g. 1:2) matching the parenthesized
 # counts in the order the proteins were written.
 # 2) SOURCE: 'pair' or 'pool' - which AF3 input_type to pull the
-# best-ranked (max ranking_score) pairwise model from.
+# best-ranked (max ranking_score) pairwise model from. Applies to
+# HOMODIMERS ONLY; heteropairs are always taken from pool (see below).
 #
 # Works for any stoichiometry, including homomultimers (NAME(N>=2)):
 # CombFold only needs ONE pairwise dimer structure per unique
 # (protein, protein) contact - reused across however many copies the
 # final assembly has.
 #
-# Pair PDB source: pooled-PPI summary_models.parquet, filtered to
-# input_type == SOURCE, best model per pair by ranking_score.
+# Pair PDB source (single 26.07 snapshot):
+#   homodimers -> summary_models.parquet (per-sample), filtered to
+#     input_type == SOURCE (pair/pool) with cross-source fallback,
+#     best model per pair by ranking_score.
+#   heteropairs -> summary_models.parquet (per-sample), filtered to
+#     input_type == 'pool' ONLY (the SOURCE flag is ignored for heteropairs;
+#     the small isolated two-body 'pair' heteropair slice is deliberately
+#     excluded), best model per pair by ranking_score.
+#   The loaded sample's own per-sample PAE (chain_pair_pae_min_{min,max,mean})
+#   is recorded per contact in <run_name>_pairs.csv.
 # ============================================================
 
 set -euo pipefail
 
 # --- Config -------------------------------------------------
 VENV="/cluster/project/beltrao/kdammer/master_thesis/.venv"
-# Homodimers: only available in the 26.07 snapshot, with a pair/pool distinction.
-POOLED_PPI_DB_HOMO="/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.07"
-# Heterodimers: only available in the older 26.04 snapshot (no pair/pool
-# distinction there - every entry is pool-derived), 26.07 has far fewer.
-POOLED_PPI_DB_HETERO="/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.04"
-SEQUENCES_PARQUET="${POOLED_PPI_DB_HOMO}/proteins.parquet"
+# Single unified snapshot (26.07) for BOTH homodimers and heteropairs.
+# Both read summary_models.parquet (per-sample), ranked by ranking_score.
+# Homodimers honor SOURCE (pair/pool) with cross-source fallback;
+# heteropairs are pool-only (SOURCE ignored).
+POOLED_PPI_DB="/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.07"
+SEQUENCES_PARQUET="${POOLED_PPI_DB}/proteins.parquet"
 COMBFOLD_SIF="/cluster/project/beltrao/shared/alphafold3/images/combfold_latest.sif"
 OUTPUT_BASE="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/first_setup/CombFold"
 # ------------------------------------------------------------
@@ -66,7 +75,7 @@ echo "Source: ${SOURCE}"
 
 mkdir -p logs
 
-export SPEC SOURCE OUTPUT_BASE SEQUENCES_PARQUET POOLED_PPI_DB_HOMO POOLED_PPI_DB_HETERO
+export SPEC SOURCE OUTPUT_BASE SEQUENCES_PARQUET POOLED_PPI_DB
 
 # --- Recompute complex name on bash side (no temp file) -----
 COMPLEX_NAME=$(python -c "
@@ -108,6 +117,7 @@ import collections
 import io
 import itertools
 import json
+import string
 import os
 import re
 import sys
@@ -125,12 +135,11 @@ spec = os.environ["SPEC"]
 source = os.environ["SOURCE"]
 output_base = os.environ["OUTPUT_BASE"]
 sequences_path = os.environ["SEQUENCES_PARQUET"]
-pooled_ppi_db_homo = os.environ["POOLED_PPI_DB_HOMO"]
-pooled_ppi_db_hetero = os.environ["POOLED_PPI_DB_HETERO"]
+pooled_ppi_db = os.environ["POOLED_PPI_DB"]
 job_id = os.environ.get("SLURM_JOB_ID", "unknown")
 
-FC_DB_HOMO = os.path.join(pooled_ppi_db_homo, "predictions-db", "predictions-db")
-FC_DB_HETERO = os.path.join(pooled_ppi_db_hetero, "predictions-db", "predictions-db")
+# Single 26.07 foldcomp DB for both homodimers and heteropairs.
+FC_DB = os.path.join(pooled_ppi_db, "predictions-db", "predictions-db")
 
 # One row per required pairwise dimer, recording exactly what was
 # requested vs. what was actually used - written out as a per-job CSV
@@ -212,8 +221,28 @@ pdbs_dir.mkdir(parents=True, exist_ok=True)
 # --- Write subunits.json (source-independent: sequence only) -------------
 sequences = pd.read_parquet(sequences_path)
 
+# CombFold requires SINGLE-character chain IDs in subunits.json (its
+# copy_pdb_rename_chain() asserts len(chain)==1). af3io.enumerate_chains()
+# rolls over to two-char names ('AA', 'AB', ...) past 'Z', which crashes
+# CombFold deep inside the container for any complex with >26 total chains.
+# Use a fixed 62-char single-character alphabet instead, and fail early with a
+# clear message if a complex needs more chains than that.
+_CHAIN_ALPHABET = string.ascii_uppercase + string.ascii_lowercase + string.digits  # 62 single chars
+
+def _single_char_chains():
+    for _c in _CHAIN_ALPHABET:
+        yield _c
+
+total_chains = sum(counts[p] for p in proteins)
+if total_chains > len(_CHAIN_ALPHABET):
+    print(
+        f"ERROR: complex {complex_name} needs {total_chains} chains, but only "
+        f"{len(_CHAIN_ALPHABET)} single-character chain IDs are supported by CombFold."
+    )
+    sys.exit(1)
+
 js = collections.OrderedDict()
-chain_iter = af3io.input.enumerate_chains()
+chain_iter = _single_char_chains()
 for protein in proteins:
     n = counts[protein]
     chain_names = [next(chain_iter) for _ in range(n)]
@@ -238,7 +267,7 @@ print(f"Written: {subunits_path}")
 # Same list for any stoichiometry - a homomultimer NAME(N>=2) still only
 # needs ONE NAME-NAME dimer structure, reused across all N copies by CombFold.
 required_homo = []    # list of (lo, lo), lowercase - only 26.07 has these
-required_hetero = []  # list of (lo, hi), lowercase - only 26.04 has these
+required_hetero = []  # list of (lo, hi), lowercase - from 26.07 summary_models
 for i, p1 in enumerate(proteins):
     for p2 in proteins[i:]:
         if p1 == p2:
@@ -291,16 +320,19 @@ if required_homo:
     # homodimer pair-jobs have their structure ingested, even though scores
     # exist for all of them in summary_models.parquet).
     candidates_homo = (
-        pl.scan_parquet(os.path.join(pooled_ppi_db_homo, "summary_models.parquet"))
+        pl.scan_parquet(os.path.join(pooled_ppi_db, "summary_models.parquet"))
         .with_columns(
             (pl.min_horizontal(["af3_id1", "af3_id2"]) + "__" +
              pl.max_horizontal(["af3_id1", "af3_id2"])).alias("pair_id")
         )
         .filter(pl.col("pair_id").is_in(required_homo_keys))
         .filter(pl.col("input_type").is_in([source, fallback_source]))
-        # FIX: Pull valid tracking columns instead of non-existent db_ids
+        # FIX: Pull valid tracking columns instead of non-existent db_ids.
+        # PAE columns are per-sample (this table is per-sample), so they describe
+        # the exact loaded model - recorded in the per-complex pairs CSV.
         .select("pair_id", "input_type", "input_name", "sample", "chain_id1", "chain_id2",
-                "ranking_score", "chain_pair_iptm")
+                "ranking_score", "chain_pair_iptm",
+                "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean")
         .collect()
     )
 
@@ -323,7 +355,7 @@ if required_homo:
                 # FIX: Dynamically build the keys from the correct input layout
                 fc_key1 = f"{row['input_name']}_{row['sample']}_{row['chain_id1']}"
                 fc_key2 = f"{row['input_name']}_{row['sample']}_{row['chain_id2']}"
-                if save_pair_pdb(FC_DB_HOMO, fc_key1, fc_key2, path_pdb):
+                if save_pair_pdb(FC_DB, fc_key1, fc_key2, path_pdb):
                     tag = "" if try_type == source else f" [FALLBACK: requested '{source}', used '{try_type}']"
                     print(f" written: {path_pdb} (type={try_type}, sample={row['sample']}, "
                           f"ranking_score={row['ranking_score']:.3f}, "
@@ -333,8 +365,13 @@ if required_homo:
                         "job_id": job_id, "run_name": run_name, "spec": spec,
                         "pair_type": "homo", "protein1": orig1, "protein2": orig2,
                         "requested_source": source, "used_source": try_type,
+                        "input_type": row["input_type"], "input_name": row["input_name"],
                         "sample": row["sample"], "ranking_score": row["ranking_score"],
-                        "chain_pair_iptm": row["chain_pair_iptm"], "status": "written",
+                        "chain_pair_iptm": row["chain_pair_iptm"],
+                        "chain_pair_pae_min_min": row["chain_pair_pae_min_min"],
+                        "chain_pair_pae_min_max": row["chain_pair_pae_min_max"],
+                        "chain_pair_pae_min_mean": row["chain_pair_pae_min_mean"],
+                        "status": "written",
                     })
                     break
                 print(f" WARNING: {try_type} sample {row['sample']} structure missing from "
@@ -350,29 +387,38 @@ if required_homo:
                 "job_id": job_id, "run_name": run_name, "spec": spec,
                 "pair_type": "homo", "protein1": orig1, "protein2": orig2,
                 "requested_source": source, "used_source": "MISSING",
-                "sample": None, "ranking_score": None,
-                "chain_pair_iptm": None, "status": "missing",
+                "input_type": None, "input_name": None,
+                "sample": None, "ranking_score": None, "chain_pair_iptm": None,
+                "chain_pair_pae_min_min": None, "chain_pair_pae_min_max": None,
+                "chain_pair_pae_min_mean": None, "status": "missing",
             })
 
     if missing:
         missing_any = True
 
-# --- Heterodimers: 26.04 summary_pairs.parquet - pool-derived only, no ---
-# --- pair/pool distinction there, so SOURCE doesn't change this lookup. ---
+# --- Heteropairs: 26.07 summary_models.parquet, POOL ONLY ---------------------
+# Heteropairs are drawn ONLY from pooled predictions (input_type == 'pool'),
+# regardless of the SOURCE flag (which governs homodimers). Rationale: a
+# heteropair extracted from the large pooled prediction is a consistent object
+# for calibration, whereas the small isolated two-body 'pair' heteropair slice
+# is a different prediction regime and is deliberately excluded here. We still
+# read summary_models.parquet at the per-sample level, rank by ranking_score
+# (same metric as homodimers), and load the exact selected sample via the
+# foldcomp key <input_name>_<sample>_<chain_id>, so the recorded PAE describes
+# the model actually assembled.
 if required_hetero:
-    if source == "pair":
-        print("NOTE: heterodimers have no direct pairwise ('pair') predictions "
-              "in the 26.04 DB - using the pooled predictions there regardless "
-              "of --paired-model.")
     required_hetero_keys = {f"{lo}__{hi}" for lo, hi in required_hetero}
     candidates_hetero = (
-        pl.scan_parquet(os.path.join(pooled_ppi_db_hetero, "summary_pairs.parquet"))
+        pl.scan_parquet(os.path.join(pooled_ppi_db, "summary_models.parquet"))
         .with_columns(
             (pl.min_horizontal(["af3_id1", "af3_id2"]) + "__" +
              pl.max_horizontal(["af3_id1", "af3_id2"])).alias("pair_id")
         )
         .filter(pl.col("pair_id").is_in(required_hetero_keys))
-        .select("pair_id", "name", "af3_id1", "af3_id2", "chain_pair_iptm_best_corrected")
+        .filter(pl.col("input_type") == "pool")
+        .select("pair_id", "input_type", "input_name", "sample", "chain_id1", "chain_id2",
+                "ranking_score", "chain_pair_iptm",
+                "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean")
         .collect()
     )
 
@@ -380,49 +426,49 @@ if required_hetero:
     for key in sorted(required_hetero_keys):
         lo, hi = key.split("__")
         orig1, orig2 = lower_to_orig[lo], lower_to_orig[hi]
-        ranked = candidates_hetero.filter(pl.col("pair_id") == key).sort(
-            "chain_pair_iptm_best_corrected", descending=True
-        )
-        if ranked.height == 0:
-            print(f"ERROR: no heterodimer predictions in 26.04 DB for {orig1} - {orig2}")
-            missing.add(key)
-            source_log_rows.append({
-                "job_id": job_id, "run_name": run_name, "spec": spec,
-                "pair_type": "hetero", "protein1": orig1, "protein2": orig2,
-                "requested_source": source, "used_source": "MISSING",
-                "sample": None, "ranking_score": None,
-                "chain_pair_iptm": None, "status": "missing",
-            })
-            continue
         path_pdb = pdbs_dir / f"AFM_{orig1}_{orig2}_unrelaxed_rank_1_model_1.pdb"
         written = False
+
+        ranked = (
+            candidates_hetero.filter(pl.col("pair_id") == key)
+            .sort("ranking_score", descending=True)
+        )
         for row in ranked.iter_rows(named=True):
-            fc_key1 = f'{row["name"]}_{row["af3_id1"]}'
-            fc_key2 = f'{row["name"]}_{row["af3_id2"]}'
-            if save_pair_pdb(FC_DB_HETERO, fc_key1, fc_key2, path_pdb):
-                print(f" written: {path_pdb} (iptm_best_corrected="
-                      f"{row['chain_pair_iptm_best_corrected']:.3f})")
+            fc_key1 = f"{row['input_name']}_{row['sample']}_{row['chain_id1']}"
+            fc_key2 = f"{row['input_name']}_{row['sample']}_{row['chain_id2']}"
+            if save_pair_pdb(FC_DB, fc_key1, fc_key2, path_pdb):
+                print(f" written: {path_pdb} (type=pool, sample={row['sample']}, "
+                      f"ranking_score={row['ranking_score']:.3f}, "
+                      f"iptm={row['chain_pair_iptm']:.3f})")
                 written = True
                 source_log_rows.append({
                     "job_id": job_id, "run_name": run_name, "spec": spec,
                     "pair_type": "hetero", "protein1": orig1, "protein2": orig2,
-                    "requested_source": source, "used_source": "pool",
-                    "sample": None, "ranking_score": None,
-                    "chain_pair_iptm": row["chain_pair_iptm_best_corrected"], "status": "written",
+                    "requested_source": "pool", "used_source": "pool",
+                    "input_type": row["input_type"], "input_name": row["input_name"],
+                    "sample": row["sample"], "ranking_score": row["ranking_score"],
+                    "chain_pair_iptm": row["chain_pair_iptm"],
+                    "chain_pair_pae_min_min": row["chain_pair_pae_min_min"],
+                    "chain_pair_pae_min_max": row["chain_pair_pae_min_max"],
+                    "chain_pair_pae_min_mean": row["chain_pair_pae_min_mean"],
+                    "status": "written",
                 })
                 break
-            print(f" WARNING: structure missing from foldcomp DB for {orig1} - {orig2} "
-                  f"pool '{row['name']}' - trying next-best pool...")
+            print(f" WARNING: pool sample {row['sample']} structure missing from "
+                  f"foldcomp DB for {orig1} - {orig2} - trying next-best...")
+
         if not written:
-            print(f"ERROR: all {ranked.height} candidate structures for {orig1} - {orig2} "
-                  f"are missing from the foldcomp DB.")
+            print(f"ERROR: no 'pool' structure found in "
+                  f"26.07 foldcomp DB for {orig1} - {orig2}.")
             missing.add(key)
             source_log_rows.append({
                 "job_id": job_id, "run_name": run_name, "spec": spec,
                 "pair_type": "hetero", "protein1": orig1, "protein2": orig2,
-                "requested_source": source, "used_source": "MISSING",
-                "sample": None, "ranking_score": None,
-                "chain_pair_iptm": None, "status": "missing",
+                "requested_source": "pool", "used_source": "MISSING",
+                "input_type": None, "input_name": None,
+                "sample": None, "ranking_score": None, "chain_pair_iptm": None,
+                "chain_pair_pae_min_min": None, "chain_pair_pae_min_max": None,
+                "chain_pair_pae_min_mean": None, "status": "missing",
             })
 
     if missing:
@@ -441,20 +487,42 @@ if source_log_rows:
 else:
     print("No source log rows to write.")
 
-# FIX #2: break down the summary by pair_type so homodimer fallbacks
-# (genuine source substitutions) are distinguishable from heterodimers
-# (which are always pool, regardless of --paired-model).
-n_requested_source = sum(1 for r in source_log_rows if r["requested_source"] == source)
-n_used_source = sum(1 for r in source_log_rows if r["used_source"] == source)
+# --- Per-complex pairs CSV: one row per REQUIRED contact (incl. missing) -----
+# Records exactly which single model CombFold used for each pairwise contact and
+# that model's own confidence metrics. Columns are a stable subset/reorder of
+# source_log_rows; PAE values are per-sample (they describe the loaded model).
+pairs_csv_cols = [
+    "run_name", "spec", "pair_type", "protein1", "protein2",
+    "requested_source", "used_source", "input_type", "input_name", "sample",
+    "ranking_score", "chain_pair_iptm",
+    "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean",
+    "status",
+]
+pairs_csv_path = log_dir / f"{run_name}_pairs.csv"
+if source_log_rows:
+    pl.DataFrame(source_log_rows).select(pairs_csv_cols).write_csv(pairs_csv_path)
+    print(f"Per-complex pairs CSV written: {pairs_csv_path}")
+else:
+    print("No pairs to write to per-complex CSV.")
+
+# Break down the summary by pair_type. Homodimers honor the requested SOURCE
+# with cross-source fallback; heteropairs are pool-only (no source choice,
+# no fallback), so they are reported separately.
+n_homo = sum(1 for r in source_log_rows if r["pair_type"] == "homo")
+n_homo_used_source = sum(1 for r in source_log_rows
+                         if r["pair_type"] == "homo" and r["used_source"] == source)
 n_fallback_homo = sum(1 for r in source_log_rows
                       if r["pair_type"] == "homo" and r["requested_source"] == source
                       and r["used_source"] not in (source, "MISSING"))
+n_hetero = sum(1 for r in source_log_rows if r["pair_type"] == "hetero")
 n_hetero_pool = sum(1 for r in source_log_rows
                     if r["pair_type"] == "hetero" and r["used_source"] == "pool")
 n_missing = sum(1 for r in source_log_rows if r["used_source"] == "MISSING")
-print(f"SUMMARY (job {job_id}): {n_requested_source} pairs requested '{source}'; "
-      f"{n_used_source} used '{source}', {n_fallback_homo} homodimer fell back, "
-      f"{n_hetero_pool} heterodimer (always pool), {n_missing} missing.")
+print(f"SUMMARY (job {job_id}): "
+      f"homodimers={n_homo} (requested '{source}': {n_homo_used_source} used '{source}', "
+      f"{n_fallback_homo} fell back); "
+      f"heteropairs={n_hetero} (pool-only: {n_hetero_pool} used pool); "
+      f"{n_missing} missing.")
 
 if missing_any:
     sys.exit(1)

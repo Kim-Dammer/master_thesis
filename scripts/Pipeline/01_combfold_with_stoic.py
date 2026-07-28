@@ -6,13 +6,13 @@ rm -r /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/5_fifth_setup
 ===========================
 uv run 01_combfold_with_stoic.py \
         --mode all \
-        --input-tsv  /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/CF_test/random_subset_Saccharomyces_cerevisiae_ComplexTab.tsv\
+        --input-tsv  /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/CF_test/random_subset_Saccharomyces_cerevisiae_ComplexTab.tsv \
         --seq-csv    /cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/all_yeast_proteins_uniprot_mapped_sequences.csv \
-        --out-dir    /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/CF_test\
+        --out-dir   /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/t3_CF_test_robost_fixed_stoic\
         --stoic-sh   s1_run_stoic.sbatch \
         --combfold-sh s2_run_CombFold.sbatch \
         --analyze-sh s3_analyze_CF_results.sbatch \
-        --top-n 10 --combfold-source pool
+        --top-n 3 --combfold-source pool
 
 Single orchestrator for the second-setup Stoic + CombFold pipeline.
 
@@ -226,8 +226,12 @@ def build_cleaned_complexes_df(tsv_path: Path) -> pl.DataFrame:
     Output columns (added):
       cleaned_ref            raw procompa.clean_identifiers output (reference)
       cleaned_complex        space-joined subunit ids, one copy each
-      true_spec              curated stoichiometry "UID(n),..." ((0)->1)
+      true_spec              curated stoichiometry "UID(n),..." ((0)->1 when at
+                             least one subunit count is known; EMPTY string
+                             when every subunit count was unknown -- there is
+                             no curated ground truth to report in that case)
       true_spec_all_unknown  bool; True if every subunit count was unknown
+                             (true_spec is "" iff this is True)
       blocker_tokens         comma-joined non-foldable tokens ('' if none)
     """
     df = pl.read_csv(tsv_path, separator="\t", quote_char=None, infer_schema_length=0)
@@ -247,7 +251,16 @@ def build_cleaned_complexes_df(tsv_path: Path) -> pl.DataFrame:
     for mol in df[MOLECULES_COL].to_list():
         counts, all_unknown, blockers = classify_molecules(mol)
         cleaned_complex.append(" ".join(counts.keys()))
-        true_specs.append(",".join(f"{uid}({counts[uid]})" for uid in counts))
+        # When EVERY subunit's ComplexPortal count was "(0)" (unknown), counts
+        # values are just the classify_molecules (0)->1 filler, not a curated
+        # ground truth. Leave true_spec EMPTY in that case rather than emitting
+        # a fabricated "UID(1),..." string that looks like real ground truth
+        # downstream (stage_expand relies on true_spec being empty/falsy to
+        # correctly mark is_true_spec / stoic_pred_correct as "unknown").
+        if all_unknown:
+            true_specs.append("")
+        else:
+            true_specs.append(",".join(f"{uid}({counts[uid]})" for uid in counts))
         all_unknown_flags.append(all_unknown)
         blocker_cols.append(",".join(blockers))
 
@@ -264,6 +277,16 @@ def build_cleaned_complexes_df(tsv_path: Path) -> pl.DataFrame:
 # Paths / config dataclass
 # ---------------------------------------------------------------------------
 
+def _opt_path(args: argparse.Namespace, name: str) -> Path | None:
+    """Resolve an optional path CLI arg to an absolute Path, or None if unset.
+
+    Uses getattr so it is safe for args that a given mode never defines; this
+    matches the original mixed 'getattr(...)/args.x' access (both resolve to the
+    same value here since argparse always defines these with default None)."""
+    val = getattr(args, name, None)
+    return Path(val).resolve() if val else None
+
+
 class Paths:
     def __init__(self, args: argparse.Namespace):
         self.out_dir = Path(args.out_dir).resolve()
@@ -271,20 +294,17 @@ class Paths:
         # Raw ComplexPortal TSV is the new front-end input. When provided, the
         # fasta stage derives the working CSV (cleaned_complexes.csv) from it and
         # every downstream stage consumes that derived CSV.
-        self.input_tsv = Path(args.input_tsv).resolve() if getattr(args, "input_tsv", None) else None
+        self.input_tsv = _opt_path(args, "input_tsv")
         self.cleaned_csv = self.out_dir / "cleaned_complexes.csv"
 
         # Local UniProt sequence CSV (uniprot_id,sequence). Sole sequence source.
-        self.seq_csv = Path(args.seq_csv).resolve() if getattr(args, "seq_csv", None) else None
+        self.seq_csv = _opt_path(args, "seq_csv")
 
         # Working input CSV: explicit --input-csv, else the derived cleaned CSV.
-        if getattr(args, "input_csv", None):
-            self.input_csv = Path(args.input_csv).resolve()
-        else:
-            self.input_csv = self.cleaned_csv
-        self.stoic_sh = Path(args.stoic_sh).resolve() if args.stoic_sh else None
-        self.combfold_sh = Path(args.combfold_sh).resolve() if args.combfold_sh else None
-        self.analyze_sh = Path(args.analyze_sh).resolve() if args.analyze_sh else None
+        self.input_csv = _opt_path(args, "input_csv") or self.cleaned_csv
+        self.stoic_sh = _opt_path(args, "stoic_sh")
+        self.combfold_sh = _opt_path(args, "combfold_sh")
+        self.analyze_sh = _opt_path(args, "analyze_sh")
         self.this_script = Path(__file__).resolve()
 
         # ------------------------------------------------------------------
@@ -336,6 +356,70 @@ def save_registry(paths: Paths, reg: dict[str, Any]) -> None:
         json.dump(reg, fh, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# SLURM submit helper (shared by all sbatch-submitting stages)
+# ---------------------------------------------------------------------------
+
+_JOBID_RE = re.compile(r"Submitted batch job (\d+)")
+
+
+def _submit_sbatch(
+    cmd: list[str],
+    tag: str,
+    *,
+    on_error: str = "exit",
+    require_jobid: bool = False,
+) -> int | None:
+    """Run an sbatch command and return the parsed SLURM job id (or None).
+
+    Consolidates the identical run -> check-returncode -> parse-"Submitted batch
+    job N" boilerplate. Behavior knobs preserve each caller's ORIGINAL handling:
+
+      on_error="exit"  -> sys.exit on non-zero returncode (submit-stoic,
+                          submit-analyze, submit-chain).
+      on_error="skip"  -> print the failure and return None, letting the caller
+                          continue (submit-combfold's per-spec loop).
+      require_jobid    -> if True, sys.exit when stdout has no parseable job id
+                          (submit-stoic). If False, return None (all others).
+
+    `tag` is the log prefix, e.g. "submit-stoic".
+    """
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        if on_error == "exit":
+            sys.exit(f"[{tag}] sbatch failed: {result.stderr.strip()}")
+        # on_error == "skip": mirror submit-combfold's per-spec failure path.
+        print(f"[{tag}]   FAILED: {result.stderr.strip()}")
+        return None
+    m = _JOBID_RE.search(result.stdout)
+    if not m:
+        if require_jobid:
+            sys.exit(f"[{tag}] could not parse job id: {result.stdout}")
+        return None
+    return int(m.group(1))
+
+
+def _redirect_sbatch_logs(text: str, logs_dir: Path, prefix: str) -> str:
+    """Rewrite the first '#SBATCH --output=' / '--error=' lines to logs_dir.
+
+    Shared by the stoic and combfold sbatch patchers; `prefix` names the log
+    files (e.g. 'stoic' -> stoic_%j.out / stoic_%j.err). Same regexes, same
+    count=1, same MULTILINE flag as the original inlined blocks, so output is
+    byte-identical.
+    """
+    text = re.sub(
+        r'^#SBATCH\s+--output=.*$',
+        f'#SBATCH --output={logs_dir}/{prefix}_%j.out',
+        text, count=1, flags=re.MULTILINE,
+    )
+    text = re.sub(
+        r'^#SBATCH\s+--error=.*$',
+        f'#SBATCH --error={logs_dir}/{prefix}_%j.err',
+        text, count=1, flags=re.MULTILINE,
+    )
+    return text
+
+
 # ===========================================================================
 # Stage 1: FASTA generation (replaces 01)
 # ===========================================================================
@@ -376,6 +460,20 @@ def _resolve_pro_chain(pro_token: str, timeout: int = 60) -> str | None:
     return None
 
 
+def _iter_seq_rows(df: pd.DataFrame):
+    """Yield cleaned (uid, seq) pairs from a uniprot_id/sequence DataFrame.
+
+    Shared cleaning rule for both sequence loaders: strip both fields and skip
+    any row with an empty uid, empty seq, or a literal 'nan' sequence. Callers
+    keep their own column-presence checks and build their own mapping shape.
+    """
+    for uid, seq in zip(df["uniprot_id"], df["sequence"]):
+        uid = str(uid).strip()
+        seq = str(seq).strip()
+        if uid and seq and seq.lower() != "nan":
+            yield uid, seq
+
+
 def _load_local_sequences(seq_csv: Path) -> dict[str, str]:
     """Load {uniprot_id: sequence} from the local sequence CSV.
 
@@ -389,13 +487,7 @@ def _load_local_sequences(seq_csv: Path) -> dict[str, str]:
     sdf = pd.read_csv(seq_csv)
     if {"uniprot_id", "sequence"} - set(sdf.columns):
         sys.exit(f"[fasta] {seq_csv} must have 'uniprot_id' and 'sequence' columns.")
-    seqs: dict[str, str] = {}
-    for uid, seq in zip(sdf["uniprot_id"], sdf["sequence"]):
-        uid = str(uid).strip()
-        seq = str(seq).strip()
-        if uid and seq and seq.lower() != "nan":
-            seqs[uid] = seq
-    return seqs
+    return {uid: seq for uid, seq in _iter_seq_rows(sdf)}
 
 
 def stage_fasta(paths: Paths) -> None:
@@ -542,15 +634,72 @@ def stage_fasta(paths: Paths) -> None:
 # Stage 2: Stoic submission (single sbatch, env-var overrides)
 # ===========================================================================
 
-def stage_submit_stoic(paths: Paths, top_n: int = 10) -> None:
+def _stoic_already_complete(paths: Paths) -> bool:
+    """Return True iff STOIC results are already present on disk for every
+    expected complex.
+
+    The expected-complex set is derived exactly as `stage_aggregate_stoic` does:
+    the unique '#Complex ac' values in `paths.input_csv` (which falls back to
+    `cleaned_complexes.csv`, written by `stage_fasta`). A complex counts as done
+    when `stoic_results/<cpx>/results.json` exists, parses as JSON, and is a
+    non-empty list. If ANY expected complex is missing that, STOIC is treated as
+    not-yet-complete (returns False). Trigger is results-on-disk, so it survives
+    loss of the job registry.
+    """
+    if not paths.input_csv.exists():
+        print(f"[submit-stoic] No input CSV at {paths.input_csv}; cannot check "
+              f"existing STOIC results.")
+        return False
+
+    df_input = pd.read_csv(paths.input_csv)
+    cpx_ids = df_input["#Complex ac"].dropna().astype(str).unique().tolist()
+    if not cpx_ids:
+        print("[submit-stoic] Input CSV lists zero complexes; cannot skip STOIC.")
+        return False
+
+    missing: list[str] = []
+    for cpx_id in cpx_ids:
+        rj = paths.stoic_results_dir / cpx_id / "results.json"
+        if not rj.exists():
+            missing.append(cpx_id)
+            continue
+        try:
+            with open(rj) as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            missing.append(cpx_id)
+            continue
+        if not isinstance(data, list) or not data:
+            missing.append(cpx_id)
+
+    n_present = len(cpx_ids) - len(missing)
+    if missing:
+        preview = ", ".join(missing[:5]) + ("..." if len(missing) > 5 else "")
+        print(f"[submit-stoic] STOIC results present for {n_present}/{len(cpx_ids)} "
+              f"complexes; {len(missing)} missing/empty ({preview}).")
+        return False
+
+    print(f"[submit-stoic] STOIC results present for all {len(cpx_ids)} complexes.")
+    return True
+
+
+def stage_submit_stoic(paths: Paths, top_n: int = 10, force: bool = False) -> None:
     """Submit the single Stoic GPU sbatch with env-var overrides for I/O paths.
 
     `top_n` is patched into the sbatch's 'stoic_predict_stoichiometry --top-n N'
     so STOIC generates exactly the number of predictions that will be expanded
     to CombFold (single source of truth).
+
+    If `force` is False and results.json already exist on disk for every expected
+    complex, submission is skipped (idempotent reruns). Pass `force=True` to
+    resubmit regardless.
     """
     if paths.stoic_sh is None or not paths.stoic_sh.exists():
         sys.exit("[submit-stoic] --stoic-sh path does not exist.")
+
+    if not force and _stoic_already_complete(paths):
+        print("[submit-stoic] Skipping submission (use --force-stoic to override).")
+        return
 
     print(f"[submit-stoic] Submitting {paths.stoic_sh} (top_n={top_n})")
 
@@ -562,6 +711,9 @@ def stage_submit_stoic(paths: Paths, top_n: int = 10) -> None:
     env["SECOND_SETUP_FASTA_DIR"] = str(paths.fastas_dir)
     env["SECOND_SETUP_OUTPUT_DIR"] = str(paths.stoic_results_dir)
 
+    # submit-stoic needs a custom env; run inline but reuse the shared parser via
+    # a small closure-free path: same behavior as _submit_sbatch(on_error=exit,
+    # require_jobid=True).
     result = subprocess.run(
         ["sbatch", str(patched_sh)],
         capture_output=True, text=True, env=env,
@@ -569,7 +721,7 @@ def stage_submit_stoic(paths: Paths, top_n: int = 10) -> None:
     if result.returncode != 0:
         sys.exit(f"[submit-stoic] sbatch failed: {result.stderr.strip()}")
 
-    m = re.search(r"Submitted batch job (\d+)", result.stdout)
+    m = _JOBID_RE.search(result.stdout)
     if not m:
         sys.exit(f"[submit-stoic] could not parse job id: {result.stdout}")
     stoic_job_id = int(m.group(1))
@@ -599,16 +751,7 @@ def _patch_combfold_sbatch(paths: Paths) -> Path:
         f'OUTPUT_BASE="{paths.combfold_out_base}"',
         text, count=1, flags=re.MULTILINE,
     )
-    text = re.sub(
-        r'^#SBATCH\s+--output=.*$',
-        f'#SBATCH --output={logs_dir}/combfold_%j.out',
-        text, count=1, flags=re.MULTILINE,
-    )
-    text = re.sub(
-        r'^#SBATCH\s+--error=.*$',
-        f'#SBATCH --error={logs_dir}/combfold_%j.err',
-        text, count=1, flags=re.MULTILINE,
-    )
+    text = _redirect_sbatch_logs(text, logs_dir, "combfold")
 
     patched_path = paths.out_dir / f"_patched_{paths.combfold_sh.name}"
     patched_path.write_text(text)
@@ -654,16 +797,7 @@ def _patch_stoic_sbatch(paths: Paths, top_n: int) -> Path:
         text,
     )
     # Redirect SBATCH --output / --error to absolute logs_dir paths.
-    text = re.sub(
-        r'^#SBATCH\s+--output=.*$',
-        f'#SBATCH --output={logs_dir}/stoic_%j.out',
-        text, count=1, flags=re.MULTILINE,
-    )
-    text = re.sub(
-        r'^#SBATCH\s+--error=.*$',
-        f'#SBATCH --error={logs_dir}/stoic_%j.err',
-        text, count=1, flags=re.MULTILINE,
-    )
+    text = _redirect_sbatch_logs(text, logs_dir, "stoic")
 
     patched_path = paths.out_dir / f"_patched_{paths.stoic_sh.name}"
     patched_path.write_text(text)
@@ -717,11 +851,7 @@ def _load_seq_to_uniprot(path: Path) -> dict[str, set[str]]:
     if {"uniprot_id", "sequence"} - set(df.columns):
         sys.exit(f"{path} missing 'uniprot_id' or 'sequence' column.")
     mapping: dict[str, set[str]] = {}
-    for _, row in df.iterrows():
-        seq = str(row["sequence"]).strip()
-        uid = str(row["uniprot_id"]).strip()
-        if not seq or not uid or seq.lower() == "nan":
-            continue
+    for uid, seq in _iter_seq_rows(df):
         mapping.setdefault(seq, set()).add(uid)
     n_shared = sum(1 for uids in mapping.values() if len(uids) > 1)
     if n_shared:
@@ -939,9 +1069,17 @@ def stage_expand(paths: Paths, top_n: int = 10) -> None:
 
     for _, row in df_input.iterrows():
         cpx_id = str(row["#Complex ac"])
-        true_spec = str(row["true_spec"])
-        true_dict = parse_spec(true_spec)
-        true_canon = canonical_spec(true_dict)
+        # pandas reads empty CSV cells as NaN (float); coerce to "". true_spec
+        # is "" exactly when ComplexPortal's own stoichiometry annotation was
+        # "(0)" (unknown) for every subunit -- see build_cleaned_complexes_df.
+        # There is no curated ground truth to compare against in that case, so
+        # is_true_spec / stoic_pred_correct must say "unknown" rather than a
+        # real True/False derived from a fabricated "1 copy each" fallback.
+        true_spec_raw = row["true_spec"]
+        true_spec = true_spec_raw if isinstance(true_spec_raw, str) else ""
+        spec_unknown = not true_spec.strip()
+        true_dict = parse_spec(true_spec) if not spec_unknown else {}
+        true_canon = canonical_spec(true_dict) if not spec_unknown else ()
         # Preserve the protein order from the true spec for the appended-true row
         true_order = [t.split("(")[0].strip()
                       for t in true_spec.split(",") if t.strip()]
@@ -974,12 +1112,21 @@ def stage_expand(paths: Paths, top_n: int = 10) -> None:
             new_row["stoich_prediction"] = stoich_str  # alias for downstream stages
             new_row["stoic_pred_rank"] = slot
             new_row["pred_score"] = prob
-            new_row["is_true_spec"] = (canonical_spec(stoich) == true_canon)
-            new_row["stoic_pred_correct"] = (canonical_spec(stoich) == true_canon)
+            if spec_unknown:
+                # No curated ground truth exists for this complex (ComplexPortal
+                # listed every subunit count as "(0)"). Do not fabricate a
+                # True/False verdict against the "1 copy each" filler value.
+                new_row["is_true_spec"] = "unknown"
+                new_row["stoic_pred_correct"] = "unknown"
+            else:
+                new_row["is_true_spec"] = (canonical_spec(stoich) == true_canon)
+                new_row["stoic_pred_correct"] = (canonical_spec(stoich) == true_canon)
             expanded_rows.append(new_row)
 
-        # Append the true row if it wasn't already among the Stoic preds
-        if true_canon and true_canon not in canon_set:
+        # Append the true row if it wasn't already among the Stoic preds.
+        # Skipped entirely when spec_unknown: there is no curated ground truth
+        # to append, and true_canon is already () in that case anyway.
+        if not spec_unknown and true_canon and true_canon not in canon_set:
             true_str = dict_to_spec_str(true_dict, protein_order=true_order)
             new_row = dict(row)
             new_row["combfold_submission"] = true_str
@@ -1043,13 +1190,7 @@ def stage_submit_combfold(
             print(f"[DRY-RUN] {' '.join(cmd)}")
             spec_to_job[spec] = None
             continue
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"[submit-combfold]   FAILED for {spec}: {result.stderr.strip()}")
-            spec_to_job[spec] = None
-            continue
-        m = re.search(r"Submitted batch job (\d+)", result.stdout)
-        jid = int(m.group(1)) if m else None
+        jid = _submit_sbatch(cmd, "submit-combfold", on_error="skip")
         spec_to_job[spec] = jid
         if jid:
             submitted_ids.append(jid)
@@ -1080,8 +1221,18 @@ def stage_submit_combfold(
 # Stage 6: Submit dependency analyze job
 # ===========================================================================
 
-def stage_submit_analyze_dependency(paths: Paths, job_ids: list[int]) -> None:
-    """Submit `11_analyze.sbatch` with --dependency=afterany on all CombFold jobs."""
+def stage_submit_analyze_dependency(
+    paths: Paths, job_ids: list[int], source: str = "pool"
+) -> None:
+    """Submit `s3_analyze_CF_results.sbatch` with --dependency=afterany on all
+    CombFold jobs.
+
+    `source` MUST match the --combfold-source the CombFold jobs were actually
+    submitted with (passed through as the sbatch script's 3rd positional arg),
+    since s2 writes results into '<complex_name>_<source>_output/' and
+    stage_analyze needs the same suffix to find them. A mismatch does not
+    error - it silently marks every row combfold_successfully=False.
+    """
     if paths.analyze_sh is None or not paths.analyze_sh.exists():
         sys.exit("[submit-analyze] --analyze-sh path does not exist.")
     if not job_ids:
@@ -1101,13 +1252,10 @@ def stage_submit_analyze_dependency(paths: Paths, job_ids: list[int]) -> None:
         str(paths.analyze_sh),
         str(paths.input_csv),
         str(paths.out_dir),
+        source,
     ]
     print(f"[submit-analyze] {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        sys.exit(f"[submit-analyze] sbatch failed: {result.stderr.strip()}")
-    m = re.search(r"Submitted batch job (\d+)", result.stdout)
-    analyze_jid = int(m.group(1)) if m else None
+    analyze_jid = _submit_sbatch(cmd, "submit-analyze", on_error="exit")
     print(f"[submit-analyze] -> analyze job {analyze_jid}")
 
     reg = load_registry(paths)
@@ -1156,11 +1304,7 @@ def stage_submit_post_stoic_chain(
         str(chain_sh),
     ]
     print(f"[submit-chain] {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        sys.exit(f"[submit-chain] sbatch failed: {result.stderr.strip()}")
-    m = re.search(r"Submitted batch job (\d+)", result.stdout)
-    chain_jid = int(m.group(1)) if m else None
+    chain_jid = _submit_sbatch(cmd, "submit-chain", on_error="exit")
     print(f"[submit-chain] -> chain job {chain_jid}")
     reg = load_registry(paths)
     reg["post_stoic_chain_job_id"] = chain_jid
@@ -1287,6 +1431,9 @@ def main() -> None:
                     help="Number of Stoic predictions per complex to expand into "
                          "CombFold jobs (default 10; the curated true_spec is "
                          "always added if not already present).")
+    ap.add_argument("--force-stoic", action="store_true",
+                    help="Resubmit STOIC even if results.json already exist on "
+                         "disk for all expected complexes (default: skip if present).")
     ap.add_argument("--combfold-source", choices=["pair", "pool"], default="pool",
                     help="SOURCE arg passed to the CombFold sbatch (default pool).")
     ap.add_argument(
@@ -1330,7 +1477,7 @@ def main() -> None:
     elif args.mode == "submit-stoic":
         if not paths.fastas_dir.exists() or not any(paths.fastas_dir.iterdir()):
             sys.exit("[submit-stoic] fastas/ is empty; run --mode fasta first.")
-        stage_submit_stoic(paths, top_n=args.top_n)
+        stage_submit_stoic(paths, top_n=args.top_n, force=args.force_stoic)
 
     elif args.mode == "aggregate-stoic":
         stage_aggregate_stoic(paths, max_preds=args.top_n)
@@ -1344,7 +1491,7 @@ def main() -> None:
         ids = stage_submit_combfold(paths, dry_run=args.dry_run,
                                     source=args.combfold_source)
         if args.analyze_sh and not args.dry_run:
-            stage_submit_analyze_dependency(paths, ids)
+            stage_submit_analyze_dependency(paths, ids, source=args.combfold_source)
 
     elif args.mode == "analyze":
         stage_analyze(paths, source=args.combfold_source)
@@ -1355,20 +1502,37 @@ def main() -> None:
         stage_expand(paths, top_n=args.top_n)
         ids = stage_submit_combfold(paths, source=args.combfold_source)
         if args.analyze_sh:
-            stage_submit_analyze_dependency(paths, ids)
+            stage_submit_analyze_dependency(paths, ids, source=args.combfold_source)
 
     elif args.mode == "all":
         # Full end-to-end via sbatch dependencies (no blocking polling).
         stage_fasta(paths)
-        stage_submit_stoic(paths, top_n=args.top_n)
-        reg = load_registry(paths)
-        stoic_jid = reg.get("stoic_job_id")
-        if not stoic_jid:
-            sys.exit("[all] No stoic_job_id in registry; cannot chain.")
-        stage_submit_post_stoic_chain(paths, stoic_jid, top_n=args.top_n,
-                                      source=args.combfold_source)
-        print(f"\n[all] Submitted Stoic job {stoic_jid} and dependent chain. "
-              f"Monitor with squeue; final CSV will appear at:\n  {paths.final_csv}")
+
+        # If STOIC already ran (results.json on disk for every complex) and the
+        # user did not force a rerun, there is no fresh stoic_job_id to chain an
+        # afterok dependency on. Run the post-STOIC steps DIRECTLY and inline
+        # (same body as --mode post-stoic-chain); the STOIC outputs already exist.
+        if not args.force_stoic and _stoic_already_complete(paths):
+            print("[all] STOIC results already present; skipping STOIC submission "
+                  "and running aggregate -> expand -> combfold -> analyze inline "
+                  "(use --force-stoic to rerun STOIC).")
+            stage_aggregate_stoic(paths, max_preds=args.top_n)
+            stage_expand(paths, top_n=args.top_n)
+            ids = stage_submit_combfold(paths, source=args.combfold_source)
+            if args.analyze_sh:
+                stage_submit_analyze_dependency(paths, ids, source=args.combfold_source)
+            print(f"\n[all] Submitted CombFold (STOIC skipped). Monitor with "
+                  f"squeue; final CSV will appear at:\n  {paths.final_csv}")
+        else:
+            stage_submit_stoic(paths, top_n=args.top_n, force=args.force_stoic)
+            reg = load_registry(paths)
+            stoic_jid = reg.get("stoic_job_id")
+            if not stoic_jid:
+                sys.exit("[all] No stoic_job_id in registry; cannot chain.")
+            stage_submit_post_stoic_chain(paths, stoic_jid, top_n=args.top_n,
+                                          source=args.combfold_source)
+            print(f"\n[all] Submitted Stoic job {stoic_jid} and dependent chain. "
+                  f"Monitor with squeue; final CSV will appear at:\n  {paths.final_csv}")
 
 
 if __name__ == "__main__":
