@@ -3,31 +3,25 @@ data/**
 !data/
 !data/.gitkeep
 
+logs/
+slurm_logs/
+
 notebooks/complex-assembly/**
 scripts/complex-assembly/**
-scripts/logs/**
 Stoic/** 
 scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/data
-scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/slurm_logs
 scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/test_chunk_analysis_results
 scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/chunk_analysis_results
 
+
+
 scripts/mmseq_homology_match/mmseqs
-scripts/mmseq_homology_match/slurm_logs
 scripts/mmseq_homology_match/all_queries.fasta
 scripts/mmseq_homology_match/mmseqs-linux-avx2.tar.gz
 
 scripts/exploratory/*.txt
 scripts/homomultimers/minimal_working_example/*.csv
 scripts/homomultimers/minimal_working_example/*.pdb
-scripts/homomultimers/minimal_working_example/logs
-scripts/homomultimers/logs
-
-
-scripts/helper_scripts/logs
-
-scripts/slurm_logs
-scripts/homomultimers/logs
 
 tmp
 

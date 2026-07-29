@@ -330,7 +330,10 @@ if required_homo:
         # FIX: Pull valid tracking columns instead of non-existent db_ids.
         # PAE columns are per-sample (this table is per-sample), so they describe
         # the exact loaded model - recorded in the per-complex pairs CSV.
-        .select("pair_id", "input_type", "input_name", "sample", "chain_id1", "chain_id2",
+        # af3_id1/af3_id2/batch_id/seed added so the full AF3 provenance of the
+        # used sample is logged for downstream per-pair metrics analysis.
+        .select("pair_id", "af3_id1", "af3_id2", "input_type", "input_name",
+                "batch_id", "seed", "sample", "chain_id1", "chain_id2",
                 "ranking_score", "chain_pair_iptm",
                 "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean")
         .collect()
@@ -365,7 +368,10 @@ if required_homo:
                         "job_id": job_id, "run_name": run_name, "spec": spec,
                         "pair_type": "homo", "protein1": orig1, "protein2": orig2,
                         "requested_source": source, "used_source": try_type,
+                        "af3_id1": row["af3_id1"], "af3_id2": row["af3_id2"],
+                        "chain_id1": row["chain_id1"], "chain_id2": row["chain_id2"],
                         "input_type": row["input_type"], "input_name": row["input_name"],
+                        "batch_id": row["batch_id"], "seed": row["seed"],
                         "sample": row["sample"], "ranking_score": row["ranking_score"],
                         "chain_pair_iptm": row["chain_pair_iptm"],
                         "chain_pair_pae_min_min": row["chain_pair_pae_min_min"],
@@ -387,7 +393,10 @@ if required_homo:
                 "job_id": job_id, "run_name": run_name, "spec": spec,
                 "pair_type": "homo", "protein1": orig1, "protein2": orig2,
                 "requested_source": source, "used_source": "MISSING",
+                "af3_id1": None, "af3_id2": None,
+                "chain_id1": None, "chain_id2": None,
                 "input_type": None, "input_name": None,
+                "batch_id": None, "seed": None,
                 "sample": None, "ranking_score": None, "chain_pair_iptm": None,
                 "chain_pair_pae_min_min": None, "chain_pair_pae_min_max": None,
                 "chain_pair_pae_min_mean": None, "status": "missing",
@@ -416,7 +425,8 @@ if required_hetero:
         )
         .filter(pl.col("pair_id").is_in(required_hetero_keys))
         .filter(pl.col("input_type") == "pool")
-        .select("pair_id", "input_type", "input_name", "sample", "chain_id1", "chain_id2",
+        .select("pair_id", "af3_id1", "af3_id2", "input_type", "input_name",
+                "batch_id", "seed", "sample", "chain_id1", "chain_id2",
                 "ranking_score", "chain_pair_iptm",
                 "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean")
         .collect()
@@ -445,7 +455,10 @@ if required_hetero:
                     "job_id": job_id, "run_name": run_name, "spec": spec,
                     "pair_type": "hetero", "protein1": orig1, "protein2": orig2,
                     "requested_source": "pool", "used_source": "pool",
+                    "af3_id1": row["af3_id1"], "af3_id2": row["af3_id2"],
+                    "chain_id1": row["chain_id1"], "chain_id2": row["chain_id2"],
                     "input_type": row["input_type"], "input_name": row["input_name"],
+                    "batch_id": row["batch_id"], "seed": row["seed"],
                     "sample": row["sample"], "ranking_score": row["ranking_score"],
                     "chain_pair_iptm": row["chain_pair_iptm"],
                     "chain_pair_pae_min_min": row["chain_pair_pae_min_min"],
@@ -465,7 +478,10 @@ if required_hetero:
                 "job_id": job_id, "run_name": run_name, "spec": spec,
                 "pair_type": "hetero", "protein1": orig1, "protein2": orig2,
                 "requested_source": "pool", "used_source": "MISSING",
+                "af3_id1": None, "af3_id2": None,
+                "chain_id1": None, "chain_id2": None,
                 "input_type": None, "input_name": None,
+                "batch_id": None, "seed": None,
                 "sample": None, "ranking_score": None, "chain_pair_iptm": None,
                 "chain_pair_pae_min_min": None, "chain_pair_pae_min_max": None,
                 "chain_pair_pae_min_mean": None, "status": "missing",
@@ -493,7 +509,9 @@ else:
 # source_log_rows; PAE values are per-sample (they describe the loaded model).
 pairs_csv_cols = [
     "run_name", "spec", "pair_type", "protein1", "protein2",
-    "requested_source", "used_source", "input_type", "input_name", "sample",
+    "requested_source", "used_source",
+    "af3_id1", "af3_id2", "chain_id1", "chain_id2",
+    "input_type", "input_name", "batch_id", "seed", "sample",
     "ranking_score", "chain_pair_iptm",
     "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean",
     "status",

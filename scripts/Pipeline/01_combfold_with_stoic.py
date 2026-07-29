@@ -6,13 +6,13 @@ rm -r /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/5_fifth_setup
 ===========================
 uv run 01_combfold_with_stoic.py \
         --mode all \
-        --input-tsv  /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/CF_test/random_subset_Saccharomyces_cerevisiae_ComplexTab.tsv \
+        --input-tsv  /cluster/project/beltrao/kdammer/master_thesis/data/Complex_Portal/Saccharomyces_cerevisiae_ComplexTab.tsv\
         --seq-csv    /cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/all_yeast_proteins_uniprot_mapped_sequences.csv \
-        --out-dir   /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/t3_CF_test_robost_fixed_stoic\
+        --out-dir    /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/5_fifth_setup_all_CP\
         --stoic-sh   s1_run_stoic.sbatch \
         --combfold-sh s2_run_CombFold.sbatch \
         --analyze-sh s3_analyze_CF_results.sbatch \
-        --top-n 3 --combfold-source pool
+        --top-n 10 --combfold-source pool
 
 Single orchestrator for the second-setup Stoic + CombFold pipeline.
 
@@ -29,7 +29,7 @@ Complexes with any protein ID missing from the local CSV are skipped + logged.
 The 'combfold_submission' column (the spec actually sent to CombFold) is filled
 in the expand stage from Stoic's predicted stoichiometries (plus the curated
 true_spec row). Every CombFold job is submitted with SOURCE=pool by default.
-
+data/Pipeline/3_third_setup
 Run with --mode all to submit the whole chain via sbatch dependencies
 (no blocking polling). Or run any single mode independently.
 
@@ -327,6 +327,9 @@ class Paths:
         self.final_csv = self.out_dir / (
             f"all_pdb_present_{s}_pipeline_complexes_combfold_results.csv"
         )
+        # Tidy long side table: one row per (complex, used pair) with the full
+        # AF3 per-pair metrics. Companion to the wide final_csv (see stage_analyze).
+        self.pairs_metrics_csv = self.out_dir / f"{s}_pairs_metrics.csv"
         self.missing_stoic_log = self.out_dir / "missing_stoic_cpxs.txt"
         self.missing_ids_log = self.out_dir / "missing_ids_complexes.txt"
         # Persistent cache of resolved PRO-chain sub-sequences (keeps reruns
@@ -1156,13 +1159,28 @@ def stage_expand(paths: Paths, top_n: int = 10) -> None:
 # ===========================================================================
 
 def stage_submit_combfold(
-    paths: Paths, dry_run: bool = False, source: str = "pool"
+    paths: Paths, dry_run: bool = False, source: str = "pool", force: bool = False
 ) -> list[int]:
     """Submit one CombFold sbatch per unique combfold_submission spec.
 
     The s2 CombFold sbatch takes TWO positional args: the spec and SOURCE
     ('pair' or 'pool'). Every job is submitted with the given `source`
     (default 'pool').
+
+    Idempotent by default (`force=False`): a spec is treated as "already
+    attempted" and NOT resubmitted if its run's stable pairs CSV
+    (`pdb_source_logs/<run_name>_pairs.csv`) already exists on disk. s2 writes
+    that file near the end of the AF3-pair-gathering phase, before the
+    CombFold search itself launches, so its presence is a disk-truth signal
+    that survives regardless of whether the job later succeeded, failed, or
+    was killed by the SLURM time limit (e.g. a 4h TIMEOUT with 0 assemblies
+    still leaves this file in place). This check is disk-based (not
+    registry-based) so it survives registry loss, matching the pattern used
+    by `_stoic_already_complete()`. Pass `force=True` to resubmit every spec
+    unconditionally (old behavior).
+
+    Returns only the job ids submitted THIS call (empty list if every spec
+    was already attempted and none needed submitting).
     """
     if paths.combfold_sh is None or not paths.combfold_sh.exists():
         sys.exit("[submit-combfold] --combfold-sh path does not exist.")
@@ -1175,16 +1193,40 @@ def stage_submit_combfold(
     # Prefer combfold_submission; fall back to stoich_prediction alias.
     spec_col = "combfold_submission" if "combfold_submission" in df.columns else "stoich_prediction"
     unique_specs = list(dict.fromkeys(df[spec_col].astype(str)))
-    print(f"[submit-combfold] {len(df)} rows -> {len(unique_specs)} unique specs "
-          f"(source={source})")
 
     # Patch the combfold sbatch so OUTPUT_BASE points at second_setup/CombFold
     patched_sh = _patch_combfold_sbatch(paths)
     print(f"[submit-combfold] using patched sbatch: {patched_sh}")
 
+    def _already_attempted(spec: str) -> bool:
+        run_name = f"{spec_to_complex_name(spec)}_{source}"
+        pairs_csv = paths.combfold_out_base / "pdb_source_logs" / f"{run_name}_pairs.csv"
+        return pairs_csv.exists()
+
+    # Existing registry job ids, keyed by spec, so skipped specs keep their
+    # previously recorded slurm_job_id instead of it being lost.
+    old_reg = load_registry(paths)
+    old_job_by_spec: dict[str, int | None] = {}
+    for entry in old_reg.get("combfold_jobs", []):
+        sp = entry.get("combfold_submission")
+        if sp is not None:
+            old_job_by_spec[str(sp)] = entry.get("slurm_job_id")
+
+    if force:
+        to_submit = list(unique_specs)
+        skipped: list[str] = []
+    else:
+        skipped = [s for s in unique_specs if _already_attempted(s)]
+        skipped_set = set(skipped)
+        to_submit = [s for s in unique_specs if s not in skipped_set]
+
+    print(f"[submit-combfold] {len(df)} rows -> {len(unique_specs)} unique specs "
+          f"(source={source}); {len(skipped)} already attempted (skipped), "
+          f"{len(to_submit)} to submit." + (" [force]" if force else ""))
+
     spec_to_job: dict[str, int | None] = {}
     submitted_ids: list[int] = []
-    for spec in unique_specs:
+    for spec in to_submit:
         cmd = ["sbatch", str(patched_sh), spec, source]
         if dry_run:
             print(f"[DRY-RUN] {' '.join(cmd)}")
@@ -1196,7 +1238,13 @@ def stage_submit_combfold(
             submitted_ids.append(jid)
         print(f"[submit-combfold]   spec='{spec[:60]}...' -> job {jid}")
 
-    # Record per-row registry entries
+    for spec in skipped:
+        # Not touched this call; carry forward whatever job id was on record.
+        spec_to_job[spec] = old_job_by_spec.get(spec)
+
+    # Record per-row registry entries. Rows for already-attempted specs keep
+    # their previously recorded slurm_job_id (via spec_to_job above) instead
+    # of this call's fresh dict silently dropping submission history.
     rows_reg: list[dict[str, Any]] = []
     for csv_row, row in df.iterrows():
         spec = str(row[spec_col])
@@ -1231,7 +1279,18 @@ def stage_submit_analyze_dependency(
     submitted with (passed through as the sbatch script's 3rd positional arg),
     since s2 writes results into '<complex_name>_<source>_output/' and
     stage_analyze needs the same suffix to find them. A mismatch does not
-    error - it silently marks every row combfold_successfully=False.
+    error - it silently reports every CF slot as n_assemblies=0 / reason='else'.
+
+    Also passes `paths.this_script` (this orchestrator's own resolved
+    absolute path, computed once in THIS process) as a 4th positional arg.
+    s3_analyze_CF_results.sbatch uses it directly instead of trying to
+    rediscover its own sibling via `dirname "${BASH_SOURCE[0]}"` at runtime:
+    under `sbatch`, SLURM copies the submitted script into a spool directory
+    before executing it, so `BASH_SOURCE[0]` inside the running job resolves
+    to that spool copy's path, not to the real scripts/Pipeline/ directory -
+    self-discovery there fails with "No such file or directory" for
+    01_combfold_with_stoic.py. Passing the known-good path explicitly avoids
+    relying on spool-relative self-discovery entirely.
     """
     if paths.analyze_sh is None or not paths.analyze_sh.exists():
         sys.exit("[submit-analyze] --analyze-sh path does not exist.")
@@ -1253,6 +1312,7 @@ def stage_submit_analyze_dependency(
         str(paths.input_csv),
         str(paths.out_dir),
         source,
+        str(paths.this_script),
     ]
     print(f"[submit-analyze] {' '.join(cmd)}")
     analyze_jid = _submit_sbatch(cmd, "submit-analyze", on_error="exit")
@@ -1332,72 +1392,391 @@ def _parse_confidence_txt(conf_path: Path) -> dict[int, float]:
     return scores
 
 
-def stage_analyze(paths: Paths, source: str = "pool") -> None:
-    """Parse CombFold outputs and write the final enriched CSV.
+# --- new helpers ------------------------------------------------------------
+# Full AF3 per-pair metric schema logged by s2 into <run_name>_pairs.csv.
+_PAIR_METRIC_FIELDS = [
+    "af3_id1", "af3_id2", "chain_id1", "chain_id2",
+    "input_name", "input_type", "batch_id", "seed", "sample",
+    "ranking_score", "chain_pair_iptm",
+    "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean",
+]
 
-    `source` MUST match the SOURCE ('pair'/'pool') the CombFold jobs were
-    submitted with: s2 writes results to '<complex_name>_<source>_output/', so
-    the reader has to reconstruct the same source-suffixed dir. Without it every
-    row falsely reports combfold_successfully=False / empty confidence.
+
+def _stoichiometry_given(identifiers: str) -> bool | None:
+    """User-provided semantics on the RAW ComplexPortal identifiers string.
+
+    Ignore non-protein tokens (CPX-..., CHEBI:...). Return:
+      * None  if no protein entries are present,
+      * False if any protein has stoichiometry 0 (i.e. unknown '(0)'),
+      * True  if all protein entries have stoichiometry != 0.
+    """
+    uniprot_entry_re = re.compile(r"([A-Za-z0-9:_-]+)\((\d+)\)")
+
+    def _is_uniprot_id(ident: str) -> bool:
+        return not (ident.startswith("CPX-") or ident.startswith("CHEBI:"))
+
+    nums = [int(n) for ident, n in uniprot_entry_re.findall(str(identifiers))
+            if _is_uniprot_id(ident)]
+    if not nums:
+        return None
+    return all(n != 0 for n in nums)
+
+
+def _read_run(run_name: str, combfold_out_base: Path, source: str) -> dict[str, Any]:
+    """Read one CombFold run's outputs + pairs CSV. Cached by run_name upstream.
+
+    Returns dict with:
+      success (bool), n_outputs (int), confidence (dict[int,float]),
+      pairs_written (list[dict] with protein1/protein2/pair_type + metrics),
+      any_missing (bool: a required pair had status 'missing'),
+      pairs_csv_exists (bool).
+    """
+    output_dir = combfold_out_base / f"{run_name}_output"
+    assembled = output_dir / "assembled_results"
+    if assembled.exists():
+        pdbs = sorted(assembled.glob("output_clustered_*.pdb"))
+        n_outputs = len(pdbs)
+    else:
+        n_outputs = 0
+    success = n_outputs > 0
+    confidence = _parse_confidence_txt(assembled / "confidence.txt")
+
+    pairs_csv = combfold_out_base / "pdb_source_logs" / f"{run_name}_pairs.csv"
+    pairs_written: list[dict[str, Any]] = []
+    any_missing = False
+    pairs_csv_exists = pairs_csv.exists()
+    if pairs_csv_exists:
+        pdf = pd.read_csv(pairs_csv)
+        for _, prow in pdf.iterrows():
+            status = str(prow.get("status", "")).strip()
+            if status == "missing":
+                any_missing = True
+                continue
+            if status != "written":
+                continue
+            entry = {
+                "protein1": str(prow.get("protein1", "")).strip(),
+                "protein2": str(prow.get("protein2", "")).strip(),
+                "pair_type": str(prow.get("pair_type", "")).strip(),
+            }
+            for f in _PAIR_METRIC_FIELDS:
+                entry[f] = prow[f] if f in pdf.columns else None
+            pairs_written.append(entry)
+    return {
+        "success": success,
+        "n_outputs": n_outputs,
+        "confidence": confidence,
+        "pairs_written": pairs_written,
+        "any_missing": any_missing,
+        "pairs_csv_exists": pairs_csv_exists,
+    }
+
+
+def _sacct_states(job_ids: list[int]) -> dict[int, str]:
+    """Batched `sacct` lookup of the base state for each job id.
+
+    One `sacct -j id1,id2,... --format=JobID,State --parsable2 --noheader`
+    call for ALL job ids at once (not per-run), to avoid hundreds/thousands
+    of subprocess calls when scaled to a full run. Rows for the '.batch' /
+    '.extern' sub-steps are skipped (only the parent job id row is kept).
+    States like 'CANCELLED by 12345' or 'CANCELLED+' are normalized to their
+    leading word (e.g. 'CANCELLED'), and 'TIMEOUT'-suffixed variants match
+    exactly on 'TIMEOUT'.
+
+    Returns {} on any failure (sacct missing, non-zero exit, unparsable
+    output, empty job_ids) -- this is non-fatal; callers must treat a missing
+    job id in the returned dict the same as "state unknown".
+    """
+    if not job_ids:
+        return {}
+    ids_arg = ",".join(str(j) for j in job_ids)
+    try:
+        result = subprocess.run(
+            ["sacct", "-j", ids_arg, "--format=JobID,State", "--parsable2", "--noheader"],
+            capture_output=True, text=True,
+        )
+    except Exception as exc:
+        print(f"[analyze] sacct lookup failed ({exc}); timeout detection disabled.")
+        return {}
+    if result.returncode != 0:
+        print(f"[analyze] sacct returned non-zero ({result.returncode}); "
+              f"timeout detection disabled. stderr: {result.stderr.strip()}")
+        return {}
+
+    states: dict[int, str] = {}
+    try:
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("|")
+            if len(parts) < 2:
+                continue
+            jobid_field, state_field = parts[0], parts[1]
+            if "." in jobid_field:
+                # Skip '.batch' / '.extern' / '.0' sub-step rows.
+                continue
+            try:
+                jid = int(jobid_field)
+            except ValueError:
+                continue
+            state = state_field.strip().split()[0] if state_field.strip() else ""
+            states[jid] = state
+    except Exception as exc:
+        print(f"[analyze] sacct output unparsable ({exc}); timeout detection disabled.")
+        return {}
+    return states
+
+
+def _reason(
+    run_exists: bool,
+    run_info: dict[str, Any] | None,
+    run_name: str | None = None,
+    job_id_by_run_name: dict[str, int] | None = None,
+    sacct_states: dict[int, str] | None = None,
+) -> str:
+    """Failure-reason for one CF slot. '' if assembled; else the category.
+
+    `run_name`/`job_id_by_run_name`/`sacct_states` are optional so existing
+    callers (and tests) that don't need timeout detection keep working
+    unchanged. When all three are supplied and the would-be 'else' case's
+    job is found in `sacct_states` with state 'TIMEOUT', return 'timed_out'
+    instead.
+    """
+    if not run_exists or run_info is None:
+        return "not_run"
+    if run_info["n_outputs"] > 0:
+        return ""
+    if run_info["any_missing"]:
+        return "pair_not_found"
+    if run_name is not None and job_id_by_run_name is not None and sacct_states is not None:
+        jid = job_id_by_run_name.get(run_name)
+        if jid is not None and sacct_states.get(jid) == "TIMEOUT":
+            return "timed_out"
+    return "else"
+
+
+def _pair_key(p1: str, p2: str) -> tuple[str, str]:
+    """Uppercased, order-independent (min,max) UniProt key."""
+    a, b = p1.upper(), p2.upper()
+    return (a, b) if a <= b else (b, a)
+
+
+def stage_analyze(paths: Paths, source: str = "pool") -> None:
+    """Build the per-complex WIDE final CSV + the tidy pairs-metrics side table.
+
+    Wide CSV (one row per '#Complex ac'):
+      complex_ac, identifiers (raw), pred_1..pred_N (stoich_json + ',' + score_json),
+      correct_pred_count, correct_pred_rank, CF_1..CF_N (_n_assemblies/_confidence/_reason),
+      CF_true_* , combfold_job_ids, n_pairs_used, pairs_used.
+    Dict/list cells are written as their repr/JSON string (single-file constraint).
+
+    Tidy CSV (paths.pairs_metrics_csv): one row per (complex_ac, used unordered
+    pair) with the full AF3 per-pair metric schema as typed columns.
+
+    `source` MUST match the SOURCE the CombFold jobs were submitted with (s2
+    writes to '<complex_name>_<source>_output/').
     """
     if source not in ("pair", "pool"):
         sys.exit(f"[analyze] source must be 'pair' or 'pool', got '{source}'.")
     print(f"[analyze] Reading {paths.expanded_csv} (source={source})")
     df = pd.read_csv(paths.expanded_csv)
 
-    # Read the SAME column stage_submit_combfold submitted from: prefer
-    # 'combfold_submission', fall back to the 'stoich_prediction' alias. If they
-    # ever diverge, keying analyze off the alias would look in a different dir
-    # than the one CombFold actually wrote.
     spec_col = "combfold_submission" if "combfold_submission" in df.columns else "stoich_prediction"
-    print(f"[analyze] Using spec column: {spec_col}")
+    ac_col = "#Complex ac"
+    id_col = "Identifiers (and stoichiometry) of molecules in complex"
 
-    col_success: list[bool] = []
-    col_n_outputs: list[int] = []
-    col_confidence: list[str] = []
+    # ---- determine N (number of pred/CF slots) -----------------------------
+    n_from_rank = 0
+    if "stoic_pred_rank" in df.columns:
+        ranks = pd.to_numeric(df["stoic_pred_rank"], errors="coerce").dropna()
+        if len(ranks):
+            n_from_rank = int(ranks.max())
+    n_from_agg = 0
+    try:
+        agg_cols = pd.read_csv(paths.stoic_agg_csv, nrows=0).columns
+        n_from_agg = sum(1 for c in agg_cols
+                         if re.fullmatch(r"pred_\d+_stoichiometry", c))
+    except Exception:
+        pass
+    N = max(n_from_rank, n_from_agg, 1)
+    print(f"[analyze] slots N={N} (from rank={n_from_rank}, from agg={n_from_agg})")
 
-    cache: dict[str, dict[str, Any]] = {}
+    # ---- aggregated STOIC strings, keyed by cpx_id -------------------------
+    agg = pd.read_csv(paths.stoic_agg_csv, dtype=str).fillna("")
+    agg_by_cpx: dict[str, dict[str, str]] = {}
+    if "cpx_id" in agg.columns:
+        for _, arow in agg.iterrows():
+            agg_by_cpx[str(arow["cpx_id"])] = dict(arow)
 
-    for idx, row in df.iterrows():
-        spec = str(row[spec_col])
-        complex_name = spec_to_complex_name(spec)
-        run_name = f"{complex_name}_{source}"  # match s2's RUN_NAME
+    # ---- job IDs per complex_name (from registry) --------------------------
+    jobs_by_cpx: dict[str, list] = {}
+    job_id_by_run_name: dict[str, int] = {}
+    try:
+        with open(paths.registry_json) as fh:
+            reg = json.load(fh)
+        for j in reg.get("combfold_jobs", []):
+            cid = str(j.get("cpx_id", ""))
+            jid = j.get("slurm_job_id")
+            if cid and jid is not None:
+                jobs_by_cpx.setdefault(cid, [])
+                if jid not in jobs_by_cpx[cid]:
+                    jobs_by_cpx[cid].append(jid)
+            cname = j.get("complex_name")
+            if cname and jid is not None:
+                # run_name = "<complex_name>_<source>"; last-one-wins on dup.
+                job_id_by_run_name[f"{cname}_{j.get('source', source)}"] = jid
+    except Exception as exc:
+        print(f"[analyze] registry not read ({exc}); combfold_job_ids empty.")
 
-        if run_name in cache:
-            c = cache[run_name]
+    # ---- sacct states, one batched call for every job id in the registry ---
+    all_job_ids = sorted({jid for jid in job_id_by_run_name.values()})
+    sacct_states = _sacct_states(all_job_ids)
+    if sacct_states:
+        still_running = [jid for jid in all_job_ids
+                          if sacct_states.get(jid) in ("PENDING", "RUNNING")]
+        if still_running:
+            print(f"[analyze] WARNING: {len(still_running)} CombFold job(s) still "
+                  f"PENDING/RUNNING at analyze-time: {still_running}")
+
+    # ---- per-run cache (assemblies/confidence/pairs) -----------------------
+    run_cache: dict[str, dict[str, Any]] = {}
+
+    def get_run(spec: str) -> dict[str, Any]:
+        rn = f"{spec_to_complex_name(spec)}_{source}"
+        if rn not in run_cache:
+            run_cache[rn] = _read_run(rn, paths.combfold_out_base, source)
+        return run_cache[rn]
+
+    wide_rows: list[dict[str, Any]] = []
+    tidy_rows: list[dict[str, Any]] = []
+
+    for cpx_id, grp in df.groupby(ac_col, sort=False):
+        cpx_id = str(cpx_id)
+        first = grp.iloc[0]
+        identifiers = first.get(id_col, "")
+        identifiers = identifiers if isinstance(identifiers, str) else ""
+
+        out: dict[str, Any] = {"complex_ac": cpx_id, "identifiers": identifiers}
+
+        agg_entry = agg_by_cpx.get(cpx_id, {})
+
+        # -- STOIC prediction columns pred_1..N (from aggregated CSV) --------
+        for i in range(1, N + 1):
+            stoich = agg_entry.get(f"pred_{i}_stoichiometry", "")
+            score = agg_entry.get(f"pred_{i}_score", "")
+            out[f"pred_{i}"] = f"{stoich},{score}" if (stoich or score) else ""
+
+        # -- correct_pred_count / correct_pred_rank --------------------------
+        given = _stoichiometry_given(identifiers)
+        pred_rows = grp[pd.to_numeric(grp["stoic_pred_rank"], errors="coerce").notna()]
+        if given is not True:
+            # None or False -> ground truth not given -> unknown
+            out["correct_pred_count"] = "unknown"
+            out["correct_pred_rank"] = "unknown"
         else:
-            output_dir = paths.combfold_out_base / f"{run_name}_output"
-            assembled = output_dir / "assembled_results"
-            if assembled.exists():
-                pdbs = sorted(assembled.glob("output_clustered_*.pdb"))
-                n_outputs = len(pdbs)
-                success = n_outputs > 0
+            correct = pred_rows[pred_rows["stoic_pred_correct"]
+                                .astype(str).str.lower().eq("true")]
+            if len(correct) == 0:
+                out["correct_pred_count"] = "none"
+                out["correct_pred_rank"] = "none"
             else:
-                n_outputs = 0
-                success = False
-            scores = _parse_confidence_txt(assembled / "confidence.txt")
-            confidence_str = ";".join(
-                f"{k}:{v:.4f}" for k, v in sorted(scores.items())
-            ) if scores else ""
-            c = {
-                "success": success,
-                "n_outputs": n_outputs,
-                "confidence_str": confidence_str,
+                ranks = pd.to_numeric(correct["stoic_pred_rank"], errors="coerce").dropna()
+                out["correct_pred_count"] = int(len(correct))
+                out["correct_pred_rank"] = int(ranks.min())
+
+        # -- CF blocks per slot ---------------------------------------------
+        # Map slot -> spec for this complex's prediction rows.
+        slot_to_spec: dict[int, str] = {}
+        for _, r in pred_rows.iterrows():
+            slot = int(float(r["stoic_pred_rank"]))
+            slot_to_spec[slot] = str(r[spec_col])
+
+        pairs_union: dict[tuple[str, str], dict[str, Any]] = {}
+
+        def collect_pairs(run_info: dict[str, Any]):
+            for pw in run_info["pairs_written"]:
+                key = _pair_key(pw["protein1"], pw["protein2"])
+                if key not in pairs_union:
+                    pairs_union[key] = pw
+
+        for i in range(1, N + 1):
+            if i in slot_to_spec:
+                spec_i = slot_to_spec[i]
+                ri = get_run(spec_i)
+                run_name_i = f"{spec_to_complex_name(spec_i)}_{source}"
+                out[f"CF_{i}_n_assemblies"] = ri["n_outputs"]
+                out[f"CF_{i}_confidence"] = ri["confidence"]
+                out[f"CF_{i}_reason"] = _reason(
+                    True, ri, run_name_i, job_id_by_run_name, sacct_states
+                )
+                collect_pairs(ri)
+            else:
+                out[f"CF_{i}_n_assemblies"] = 0
+                out[f"CF_{i}_confidence"] = {}
+                out[f"CF_{i}_reason"] = "not_run"
+
+        # -- CF_true block ---------------------------------------------------
+        # Synthetic true row: stoic_pred_rank is NA AND is_true_spec == True.
+        rank_na = pd.to_numeric(grp["stoic_pred_rank"], errors="coerce").isna()
+        is_true = grp["is_true_spec"].astype(str).str.lower().eq("true")
+        true_rows = grp[rank_na & is_true]
+        if len(true_rows):
+            true_spec = str(true_rows.iloc[0][spec_col])
+            rt = get_run(true_spec)
+            run_name_true = f"{spec_to_complex_name(true_spec)}_{source}"
+            out["CF_true_n_assemblies"] = rt["n_outputs"]
+            out["CF_true_confidence"] = rt["confidence"]
+            out["CF_true_reason"] = _reason(
+                True, rt, run_name_true, job_id_by_run_name, sacct_states
+            )
+            collect_pairs(rt)
+        else:
+            out["CF_true_n_assemblies"] = 0
+            out["CF_true_confidence"] = {}
+            out["CF_true_reason"] = "not_run"
+
+        # -- job ids + pairs summary ----------------------------------------
+        out["combfold_job_ids"] = jobs_by_cpx.get(cpx_id, [])
+
+        pair_labels = sorted(f"{a}_{b}" for (a, b) in pairs_union)
+        out["n_pairs_used"] = len(pair_labels)
+        out["pairs_used"] = pair_labels
+
+        # -- tidy rows -------------------------------------------------------
+        for (a, b), pw in sorted(pairs_union.items()):
+            trow = {
+                "complex_ac": cpx_id,
+                "protein1": pw["protein1"].upper(),
+                "protein2": pw["protein2"].upper(),
+                "pair": f"{a}_{b}",
+                "pair_type": pw["pair_type"],
             }
-            cache[run_name] = c
-            print(f"[analyze]   row {idx}: {run_name} -> "
-                  f"success={c['success']}, n={c['n_outputs']}")
+            for f in _PAIR_METRIC_FIELDS:
+                trow[f] = pw.get(f)
+            tidy_rows.append(trow)
 
-        col_success.append(c["success"])
-        col_n_outputs.append(c["n_outputs"])
-        col_confidence.append(c["confidence_str"])
+        wide_rows.append(out)
 
-    df["combfold_successfully"] = col_success
-    df["n_assembled_outputs"] = col_n_outputs
-    df["confidence_scores"] = col_confidence
+    # ---- write wide CSV ----------------------------------------------------
+    # Fixed column order, identical across rows.
+    cols = ["complex_ac", "identifiers"]
+    cols += [f"pred_{i}" for i in range(1, N + 1)]
+    cols += ["correct_pred_count", "correct_pred_rank"]
+    for i in range(1, N + 1):
+        cols += [f"CF_{i}_n_assemblies", f"CF_{i}_confidence", f"CF_{i}_reason"]
+    cols += ["CF_true_n_assemblies", "CF_true_confidence", "CF_true_reason"]
+    cols += ["combfold_job_ids", "n_pairs_used", "pairs_used"]
 
-    df.to_csv(paths.final_csv, index=False)
-    print(f"[analyze] Wrote {len(df)} rows -> {paths.final_csv}")
+    wide = pd.DataFrame(wide_rows, columns=cols)
+    wide.to_csv(paths.final_csv, index=False)
+    print(f"[analyze] Wrote {len(wide)} complex rows -> {paths.final_csv}")
+
+    # ---- write tidy pairs-metrics CSV --------------------------------------
+    tidy_cols = ["complex_ac", "protein1", "protein2", "pair", "pair_type"] + _PAIR_METRIC_FIELDS
+    tidy = pd.DataFrame(tidy_rows, columns=tidy_cols)
+    tidy.to_csv(paths.pairs_metrics_csv, index=False)
+    print(f"[analyze] Wrote {len(tidy)} pair rows -> {paths.pairs_metrics_csv}")
 
 
 # ===========================================================================
@@ -1434,6 +1813,11 @@ def main() -> None:
     ap.add_argument("--force-stoic", action="store_true",
                     help="Resubmit STOIC even if results.json already exist on "
                          "disk for all expected complexes (default: skip if present).")
+    ap.add_argument("--force-combfold", action="store_true",
+                    help="Resubmit CombFold for every spec even if it was already "
+                         "attempted (has a pdb_source_logs/<run>_pairs.csv on disk), "
+                         "regardless of whether that prior attempt succeeded, failed, "
+                         "or timed out (default: skip specs already attempted).")
     ap.add_argument("--combfold-source", choices=["pair", "pool"], default="pool",
                     help="SOURCE arg passed to the CombFold sbatch (default pool).")
     ap.add_argument(
@@ -1489,7 +1873,8 @@ def main() -> None:
         if not paths.expanded_csv.exists():
             sys.exit("[submit-combfold] expanded.csv missing; run --mode expand first.")
         ids = stage_submit_combfold(paths, dry_run=args.dry_run,
-                                    source=args.combfold_source)
+                                    source=args.combfold_source,
+                                    force=args.force_combfold)
         if args.analyze_sh and not args.dry_run:
             stage_submit_analyze_dependency(paths, ids, source=args.combfold_source)
 
@@ -1500,9 +1885,15 @@ def main() -> None:
         # Internal: this is what the dependency sbatch runs after Stoic finishes.
         stage_aggregate_stoic(paths, max_preds=args.top_n)
         stage_expand(paths, top_n=args.top_n)
-        ids = stage_submit_combfold(paths, source=args.combfold_source)
-        if args.analyze_sh:
-            stage_submit_analyze_dependency(paths, ids, source=args.combfold_source)
+        ids = stage_submit_combfold(paths, source=args.combfold_source,
+                                    force=args.force_combfold)
+        if ids:
+            if args.analyze_sh:
+                stage_submit_analyze_dependency(paths, ids, source=args.combfold_source)
+        else:
+            print("[post-stoic-chain] No new CombFold jobs submitted (all specs "
+                  "already attempted); running analyze inline now.")
+            stage_analyze(paths, source=args.combfold_source)
 
     elif args.mode == "all":
         # Full end-to-end via sbatch dependencies (no blocking polling).
@@ -1518,11 +1909,18 @@ def main() -> None:
                   "(use --force-stoic to rerun STOIC).")
             stage_aggregate_stoic(paths, max_preds=args.top_n)
             stage_expand(paths, top_n=args.top_n)
-            ids = stage_submit_combfold(paths, source=args.combfold_source)
-            if args.analyze_sh:
-                stage_submit_analyze_dependency(paths, ids, source=args.combfold_source)
-            print(f"\n[all] Submitted CombFold (STOIC skipped). Monitor with "
-                  f"squeue; final CSV will appear at:\n  {paths.final_csv}")
+            ids = stage_submit_combfold(paths, source=args.combfold_source,
+                                        force=args.force_combfold)
+            if ids:
+                if args.analyze_sh:
+                    stage_submit_analyze_dependency(paths, ids, source=args.combfold_source)
+                print(f"\n[all] Submitted CombFold (STOIC skipped). Monitor with "
+                      f"squeue; final CSV will appear at:\n  {paths.final_csv}")
+            else:
+                print("[all] No new CombFold jobs needed (every spec already "
+                      "attempted); running analyze inline now "
+                      "(use --force-combfold to rerun CombFold).")
+                stage_analyze(paths, source=args.combfold_source)
         else:
             stage_submit_stoic(paths, top_n=args.top_n, force=args.force_stoic)
             reg = load_registry(paths)
