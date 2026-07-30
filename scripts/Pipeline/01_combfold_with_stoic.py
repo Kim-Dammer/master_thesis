@@ -6,13 +6,13 @@ rm -r /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/5_fifth_setup
 ===========================
 uv run 01_combfold_with_stoic.py \
         --mode all \
-        --input-tsv  /cluster/project/beltrao/kdammer/master_thesis/data/Complex_Portal/Saccharomyces_cerevisiae_ComplexTab.tsv\
+        --input-tsv  /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/t4_CF_test_redo_second_and_third_setup.tsv\
         --seq-csv    /cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/all_yeast_proteins_uniprot_mapped_sequences.csv \
-        --out-dir    /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/5_fifth_setup_all_CP\
+        --out-dir    /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/t4_CF_test_redo_second_and_third_setup\
         --stoic-sh   s1_run_stoic.sbatch \
         --combfold-sh s2_run_CombFold.sbatch \
         --analyze-sh s3_analyze_CF_results.sbatch \
-        --top-n 10 --combfold-source pool
+        --top-n 3 --combfold-source pool
 
 Single orchestrator for the second-setup Stoic + CombFold pipeline.
 
@@ -76,7 +76,7 @@ from procompa.helpers import clean_identifiers
 # <name>_expanded.csv, <name>_job_registry.json, stoic_results_aggregated_
 # <name>.csv, all_pdb_present_<name>_pipeline_..._results.csv). Override at the
 # command line with --setup-name without editing this file.
-SETUP_NAME = "fifth_setup"
+SETUP_NAME = "t4_CF_test"
 
 # Raw ComplexPortal column that holds the pipe-separated molecule identifiers.
 MOLECULES_COL = "Identifiers (and stoichiometry) of molecules in complex"
