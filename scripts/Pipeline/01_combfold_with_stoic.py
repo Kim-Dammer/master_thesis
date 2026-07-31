@@ -125,9 +125,14 @@ def dict_to_spec_str(d: dict[str, int], protein_order: list[str] | None = None) 
 
 
 def spec_to_complex_name(spec: str) -> str:
-    """Mirror 05_run_CombFold.sbatch: sorted UniProt IDs joined as '{id}x{count}'."""
+    """Mirror 05_run_CombFold.sbatch: sorted UniProt IDs joined as '{id}x{count}'.
+    Truncated with a hash suffix if the name would exceed ext4's 255-byte limit."""
     counts = parse_spec(spec)
-    return "_".join(f"{p}x{counts[p]}" for p in sorted(counts))
+    name = "_".join(f"{p}x{counts[p]}" for p in sorted(counts))
+    if len(name) > 200:
+        import hashlib
+        name = name[:180] + "_" + hashlib.sha1(name.encode()).hexdigest()[:12]
+    return name
 
 
 def spec_to_proteins(spec: str) -> list[str]:
@@ -332,6 +337,7 @@ class Paths:
         self.pairs_metrics_csv = self.out_dir / f"{s}_pairs_metrics.csv"
         self.missing_stoic_log = self.out_dir / "missing_stoic_cpxs.txt"
         self.missing_ids_log = self.out_dir / "missing_ids_complexes.txt"
+        self.monomer_skip_log = self.out_dir / "monomer_specs_skipped.txt"
         # Persistent cache of resolved PRO-chain sub-sequences (keeps reruns
         # offline without mutating the user's --seq-csv).
         self.pro_cache_csv = self.out_dir / "pro_chain_sequences.csv"
@@ -1193,6 +1199,20 @@ def stage_submit_combfold(
     # Prefer combfold_submission; fall back to stoich_prediction alias.
     spec_col = "combfold_submission" if "combfold_submission" in df.columns else "stoich_prediction"
     unique_specs = list(dict.fromkeys(df[spec_col].astype(str)))
+
+    # CombFold assembly is meaningless for a single chain, so monomers are filtered out
+    def _is_monomer(spec: str) -> bool:
+        counts = parse_spec(spec)
+        return len(counts) == 1 and next(iter(counts.values())) == 1
+
+    monomer_specs = [s for s in unique_specs if _is_monomer(s)]
+    if monomer_specs:
+        with open(paths.monomer_skip_log, "w") as fh:
+            for s in monomer_specs:
+                fh.write(f"{s}")
+        print(f"[submit-combfold] {len(monomer_specs)} single-protein spec(s) "
+              f"skipped (no pairs to assemble) -> {paths.monomer_skip_log}")
+    unique_specs = [s for s in unique_specs if s not in set(monomer_specs)]
 
     # Patch the combfold sbatch so OUTPUT_BASE points at second_setup/CombFold
     patched_sh = _patch_combfold_sbatch(paths)

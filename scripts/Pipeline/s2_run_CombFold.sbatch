@@ -79,7 +79,7 @@ export SPEC SOURCE OUTPUT_BASE SEQUENCES_PARQUET POOLED_PPI_DB
 
 # --- Recompute complex name on bash side (no temp file) -----
 COMPLEX_NAME=$(python -c "
-import os, re
+import os, re, hashlib
 spec = os.environ['SPEC']
 entry_re = re.compile(r'^([A-Za-z0-9_]+)\((\d+)\)\$')
 counts = {}
@@ -87,7 +87,10 @@ for tok in [t.strip() for t in spec.split(',') if t.strip()]:
     m = entry_re.match(tok)
     if m:
         counts[m.group(1)] = int(m.group(2))
-print('_'.join(f'{p}x{counts[p]}' for p in sorted(counts)))
+name = '_'.join(f'{p}x{counts[p]}' for p in sorted(counts))
+if len(name) > 200:
+    name = name[:180] + '_' + hashlib.sha1(name.encode()).hexdigest()[:12]
+print(name)
 ")
 
 if [[ -z "${COMPLEX_NAME}" ]]; then
@@ -209,6 +212,9 @@ if ratio_token is not None:
 proteins = sorted(counts)
 counts = collections.OrderedDict((p, counts[p]) for p in proteins)
 complex_name = "_".join(f"{p}x{counts[p]}" for p in proteins)
+if len(complex_name) > 200:
+    import hashlib
+    complex_name = complex_name[:180] + "_" + hashlib.sha1(complex_name.encode()).hexdigest()[:12]
 run_name = f"{complex_name}_{source}"
 print(f"Resolved complex: {complex_name}")
 print(f"Stoichiometry: {dict(counts)}")
@@ -495,7 +501,7 @@ if required_hetero:
 # --- Per-job source log: exact record of what was requested vs used ------
 log_dir = Path(output_base) / "pdb_source_logs"
 log_dir.mkdir(parents=True, exist_ok=True)
-log_path = log_dir / f"{run_name}_{job_id}.csv"
+log_path = log_dir / f"{run_name}_pairs.csv"
 # FIX #3: only claim the log was written if we actually wrote it.
 if source_log_rows:
     pl.DataFrame(source_log_rows).write_csv(log_path)

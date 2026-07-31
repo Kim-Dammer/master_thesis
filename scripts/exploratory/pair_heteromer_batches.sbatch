@@ -9,7 +9,7 @@
 #SBATCH --mem-per-cpu=50G
 
 # For all heterodimers (af3_id1 != af3_id2) with input_type='pair',
-# show which batch_id they came from. if all from probabaly from paola
+# show which batch_id they came from. if all the same then from probabaly from paola
 #
 # Output: pair_heteromer_batches.csv (batch_id, n_models, n_unique_pairs)
 
