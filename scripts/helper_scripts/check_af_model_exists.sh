@@ -5,8 +5,8 @@
 #SBATCH --output=logs/check_af_model_exists_%j.out
 #SBATCH --error=logs/check_af_model_exists_%j.err
 #SBATCH --time=01:00:00
-#SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=5G
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=20G
 
 # check_af_model_exists.sh  <input_pairs.parquet>  <output_dir>
 #
