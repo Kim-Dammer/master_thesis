@@ -76,7 +76,7 @@ from procompa.helpers import clean_identifiers
 # <name>_expanded.csv, <name>_job_registry.json, stoic_results_aggregated_
 # <name>.csv, all_pdb_present_<name>_pipeline_..._results.csv). Override at the
 # command line with --setup-name without editing this file.
-SETUP_NAME = "t4_CF_test"
+SETUP_NAME = "t7_CF_test"
 
 # Raw ComplexPortal column that holds the pipe-separated molecule identifiers.
 MOLECULES_COL = "Identifiers (and stoichiometry) of molecules in complex"

@@ -39,6 +39,10 @@
 #     excluded), best model per pair by ranking_score.
 #   The loaded sample's own per-sample PAE (chain_pair_pae_min_{min,max,mean})
 #   is recorded per contact in <run_name>_pairs.csv.
+#
+#   Structures themselves are fetched from a single SQLite DB
+#   (models.sqlite: table 'models', columns db_id/fcz, foldcomp-compressed)
+#   for BOTH 'pair' and 'pool' input_type rows. 
 # ============================================================
 
 set -euo pipefail
@@ -118,7 +122,6 @@ echo "[$(date)] Parsing spec, writing subunits.json and pairwise PDBs (source=${
 python - <<'EOF'
 import collections
 import io
-import itertools
 import json
 import string
 import os
@@ -132,6 +135,8 @@ import polars as pl
 import pandas as pd
 import Bio.PDB
 import foldcomp
+import sqlite_utils
+from sqlite_utils.db import NotFoundError
 import af3io
 
 spec = os.environ["SPEC"]
@@ -141,8 +146,37 @@ sequences_path = os.environ["SEQUENCES_PARQUET"]
 pooled_ppi_db = os.environ["POOLED_PPI_DB"]
 job_id = os.environ.get("SLURM_JOB_ID", "unknown")
 
-# Single 26.07 foldcomp DB for both homodimers and heteropairs.
-FC_DB = os.path.join(pooled_ppi_db, "predictions-db", "predictions-db")
+# Single 26.07 structure DB for both homodimers and heteropairs.
+# NOTE: the older flat foldcomp file (predictions-db/predictions-db) is
+# retired -- it started silently dropping entries as structure counts grew
+# (only ~5% of homodimer 'pair' jobs were ever ingested there, even though
+# summary_models.parquet had scores for all of them). All structures are
+# now stored as compressed blobs in a single SQLite database instead.
+SQLITE_DB = os.path.join(pooled_ppi_db, "models.sqlite")
+_sqlite_db_handle = None
+
+
+def _get_sqlite_db() -> sqlite_utils.Database:
+    """Lazily open and cache one SQLite connection for this job (a >100GB
+    file should be opened once, not per lookup)."""
+    global _sqlite_db_handle
+    if _sqlite_db_handle is None:
+        _sqlite_db_handle = sqlite_utils.Database(SQLITE_DB)
+    return _sqlite_db_handle
+
+
+def _fetch_pdb_str(db: sqlite_utils.Database, id_: str) -> str | None:
+    """Fetch and decompress one model's PDB text by its db_id key.
+    Returns None (never raises) if the id isn't in the DB."""
+    try:
+        row = db["models"].get(id_)
+    except NotFoundError:
+        return None
+    db_id, pdb_str = foldcomp.decompress(row["fcz"])
+    if db_id != id_:
+        print(f"  WARNING: SQLite id mismatch: requested {id_}, got {db_id}")
+        return None
+    return pdb_str
 
 # One row per required pairwise dimer, recording exactly what was
 # requested vs. what was actually used - written out as a per-job CSV
@@ -287,27 +321,26 @@ print(f"Required heteropairs ({len(required_hetero)}): {required_hetero}")
 
 lower_to_orig = {p.lower(): p for p in proteins}
 
-# --- save_ids equivalent: merge two foldcomp chain-structures into one PDB ---
+# --- save_ids equivalent: merge two SQLite-stored chain-structures into one PDB ---
 # Returns False (instead of crashing) if either entry is missing from the
-# foldcomp DB, so the caller can fall back to the next-best sample.
-def save_pair_pdb(fc_db: str, fc_key1: str, fc_key2: str, out_path: Path) -> bool:
+# SQLite predictions DB, so the caller can fall back to the next-best sample.
+def save_pair_pdb(fc_key1: str, fc_key2: str, out_path: Path) -> bool:
+    db = _get_sqlite_db()
     parser = Bio.PDB.PDBParser(QUIET=True)
     struct0 = None
-    n_found = 0
-    with foldcomp.open(fc_db, ids=[fc_key1, fc_key2]) as db:
-        for index, ((name, pdb), chain_id) in enumerate(
-            itertools.islice(zip(db, af3io.input.enumerate_chains()), None)
-        ):
-            n_found += 1
-            struct = parser.get_structure(index, io.StringIO(pdb))
-            if index == 0:
-                struct0 = struct
-            else:
-                chain0 = next(struct[0].get_chains())
-                chain0.id = chain_id
-                struct0[0].add(chain0)
-    if n_found < 2 or struct0 is None:
-        return False
+    for index, (id_, chain_id) in enumerate(
+        zip([fc_key1, fc_key2], af3io.input.enumerate_chains())
+    ):
+        pdb_str = _fetch_pdb_str(db, id_)
+        if pdb_str is None:
+            return False
+        struct = parser.get_structure(index, io.StringIO(pdb_str))
+        if index == 0:
+            struct0 = struct
+        else:
+            chain0 = next(struct[0].get_chains())
+            chain0.id = chain_id
+            struct0[0].add(chain0)
     pdbio = Bio.PDB.PDBIO()
     pdbio.set_structure(struct0)
     pdbio.save(str(out_path))
@@ -322,7 +355,8 @@ if required_homo:
     fallback_source = "pool" if source == "pair" else "pair"
     # Keep ALL candidate samples for BOTH input_types (not just the requested
     # source), so we can fall back across sources if the requested one has
-    # no structure in the foldcomp DB at all (common for 'pair': only ~5% of
+    # no structure in the SQLite predictions DB at all (common historically for
+    # 'pair' under the retired flat-file backend: only ~5% of
     # homodimer pair-jobs have their structure ingested, even though scores
     # exist for all of them in summary_models.parquet).
     candidates_homo = (
@@ -364,7 +398,7 @@ if required_homo:
                 # FIX: Dynamically build the keys from the correct input layout
                 fc_key1 = f"{row['input_name']}_{row['sample']}_{row['chain_id1']}"
                 fc_key2 = f"{row['input_name']}_{row['sample']}_{row['chain_id2']}"
-                if save_pair_pdb(FC_DB, fc_key1, fc_key2, path_pdb):
+                if save_pair_pdb(fc_key1, fc_key2, path_pdb):
                     tag = "" if try_type == source else f" [FALLBACK: requested '{source}', used '{try_type}']"
                     print(f" written: {path_pdb} (type={try_type}, sample={row['sample']}, "
                           f"ranking_score={row['ranking_score']:.3f}, "
@@ -387,13 +421,13 @@ if required_homo:
                     })
                     break
                 print(f" WARNING: {try_type} sample {row['sample']} structure missing from "
-                      f"foldcomp DB for {orig1} - trying next-best...")
+                      f"SQLite predictions DB for {orig1} - trying next-best...")
             if written:
                 break
 
         if not written:
             print(f"ERROR: no '{source}' or fallback '{fallback_source}' structure found in "
-                  f"foldcomp DB for {orig1} (self-pair).")
+                  f"SQLite predictions DB for {orig1} (self-pair).")
             missing.add(key)
             source_log_rows.append({
                 "job_id": job_id, "run_name": run_name, "spec": spec,
@@ -452,7 +486,7 @@ if required_hetero:
         for row in ranked.iter_rows(named=True):
             fc_key1 = f"{row['input_name']}_{row['sample']}_{row['chain_id1']}"
             fc_key2 = f"{row['input_name']}_{row['sample']}_{row['chain_id2']}"
-            if save_pair_pdb(FC_DB, fc_key1, fc_key2, path_pdb):
+            if save_pair_pdb(fc_key1, fc_key2, path_pdb):
                 print(f" written: {path_pdb} (type=pool, sample={row['sample']}, "
                       f"ranking_score={row['ranking_score']:.3f}, "
                       f"iptm={row['chain_pair_iptm']:.3f})")
@@ -474,11 +508,11 @@ if required_hetero:
                 })
                 break
             print(f" WARNING: pool sample {row['sample']} structure missing from "
-                  f"foldcomp DB for {orig1} - {orig2} - trying next-best...")
+                  f"SQLite predictions DB for {orig1} - {orig2} - trying next-best...")
 
         if not written:
             print(f"ERROR: no 'pool' structure found in "
-                  f"26.07 foldcomp DB for {orig1} - {orig2}.")
+                  f"26.07 SQLite predictions DB for {orig1} - {orig2}.")
             missing.add(key)
             source_log_rows.append({
                 "job_id": job_id, "run_name": run_name, "spec": spec,
