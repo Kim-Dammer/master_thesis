@@ -36,6 +36,16 @@
 #                      location -- self-discovery would then fail with
 #                      "No such file or directory" for 01_combfold_with_stoic.py.
 #                      Always pass $4 explicitly when submitting via sbatch.
+#   $5  setup_name    — (optional) forwarded as --setup-name to the
+#                      orchestrator. 01_combfold_with_stoic.py's
+#                      stage_submit_analyze_dependency always passes this
+#                      explicitly (paths.setup_name). If omitted, the
+#                      orchestrator falls back to its own hardcoded
+#                      SETUP_NAME default -- which silently reads/writes the
+#                      WRONG expanded_csv/registry/final CSV if you actually
+#                      ran the pipeline under a different --setup-name.
+#                      Always pass $5 explicitly when your run uses a
+#                      non-default --setup-name.
 #
 # Submitted from: 01_combfold_with_stoic.py
 # ===========================================================================
@@ -49,6 +59,7 @@ SOURCE="${3:-pool}"
 VENV="/cluster/project/beltrao/kdammer/master_thesis/.venv"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCHESTRATOR="${4:-${SCRIPT_DIR}/01_combfold_with_stoic.py}"
+SETUP_NAME_ARG="${5:-}"
 
 if [[ ! -f "${ORCHESTRATOR}" ]]; then
     echo "ERROR: orchestrator script not found: ${ORCHESTRATOR}"
@@ -65,14 +76,19 @@ mkdir -p "${OUT_DIR}/logs"
 source "${VENV}/bin/activate"
 
 echo "[$(date)] Running analyze stage..."
-echo "  input_csv: ${INPUT_CSV}"
-echo "  out_dir:   ${OUT_DIR}"
-echo "  source:    ${SOURCE}"
+echo "  input_csv:  ${INPUT_CSV}"
+echo "  out_dir:    ${OUT_DIR}"
+echo "  source:     ${SOURCE}"
+echo "  setup_name: ${SETUP_NAME_ARG:-<not passed -- orchestrator will use its default SETUP_NAME>}"
 
-python "${ORCHESTRATOR}" \
-    --input-csv       "${INPUT_CSV}" \
-    --out-dir         "${OUT_DIR}" \
-    --combfold-source "${SOURCE}" \
-    --mode            analyze
+CMD=(python "${ORCHESTRATOR}"
+    --input-csv       "${INPUT_CSV}"
+    --out-dir         "${OUT_DIR}"
+    --combfold-source "${SOURCE}"
+    --mode            analyze)
+if [[ -n "${SETUP_NAME_ARG}" ]]; then
+    CMD+=(--setup-name "${SETUP_NAME_ARG}")
+fi
+"${CMD[@]}"
 
 echo "[$(date)] Analyze complete."

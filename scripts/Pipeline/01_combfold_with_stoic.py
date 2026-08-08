@@ -42,9 +42,9 @@ Layout written:
         stoic_results/<CPX>/{af3_input_*.json, results.json}
         stoic_results_aggregated_second_setup.csv
         second_setup_expanded.csv      (adds combfold_submission per Stoic pred)
-        second_setup_job_registry.json
+        second_setup_pool_job_registry.json
         CombFold/<complex_name>_output/...
-        all_pdb_present_second_setup_pipeline_complexes_combfold_results.csv
+        all_pdb_present_second_setup_pool_pipeline_complexes_combfold_results.csv
 """
 
 from __future__ import annotations
@@ -73,9 +73,13 @@ from procompa.helpers import clean_identifiers
 # ---------------------------------------------------------------------------
 # SETUP_NAME: the ONE place to rename a run. It is interpolated into every
 # setup-tagged output filename (uniprot_mapped_seq_<name>.csv,
-# <name>_expanded.csv, <name>_job_registry.json, stoic_results_aggregated_
-# <name>.csv, all_pdb_present_<name>_pipeline_..._results.csv). Override at the
-# command line with --setup-name without editing this file.
+# <name>_expanded.csv, stoic_results_aggregated_<name>.csv). The job registry,
+# final wide CSV, and pairs CSV are additionally tagged with --combfold-source
+# (<name>_<source>_job_registry.json, all_pdb_present_<name>_<source>_
+# pipeline_..._results.csv, <name>_<source>_pairs_metrics.csv) so a pool run
+# and a pair run against the same --out-dir/--setup-name don't overwrite each
+# other. Override at the command line with --setup-name without editing this
+# file.
 SETUP_NAME = "t8_CF_test"
 
 # Raw ComplexPortal column that holds the pipe-separated molecule identifiers.
@@ -320,6 +324,16 @@ class Paths:
         # ------------------------------------------------------------------
         self.setup_name = getattr(args, "setup_name", None) or SETUP_NAME
         s = self.setup_name
+        # CombFold SOURCE ('pool'/'pair') folded into every filename below that
+        # stage_submit_combfold/stage_analyze write to. Without this, a full
+        # --combfold-source pool run followed by a full --combfold-source pair
+        # run against the same --out-dir/--setup-name silently overwrite each
+        # other's job registry, wide results CSV, and pairs CSV (all three were
+        # previously keyed on setup_name alone, with no source in the name).
+        # combfold_source always has an argparse default ("pool"), but fall
+        # back defensively in case Paths() is ever constructed from a bare
+        # Namespace that lacks it (e.g. tests).
+        src = getattr(args, "combfold_source", None) or "pool"
 
         # Subpaths
         self.fastas_dir = self.out_dir / "fastas"
@@ -327,14 +341,14 @@ class Paths:
         self.stoic_results_dir = self.out_dir / "stoic_results"
         self.stoic_agg_csv = self.out_dir / f"stoic_results_aggregated_{s}.csv"
         self.expanded_csv = self.out_dir / f"{s}_expanded.csv"
-        self.registry_json = self.out_dir / f"{s}_job_registry.json"
+        self.registry_json = self.out_dir / f"{s}_{src}_job_registry.json"
         self.combfold_out_base = self.out_dir / "CombFold"
         self.final_csv = self.out_dir / (
-            f"all_pdb_present_{s}_pipeline_complexes_combfold_results.csv"
+            f"all_pdb_present_{s}_{src}_pipeline_complexes_combfold_results.csv"
         )
         # Tidy long side table: one row per (complex, used pair) with the full
         # AF3 per-pair metrics. Companion to the wide final_csv (see stage_analyze).
-        self.pairs_metrics_csv = self.out_dir / f"{s}_pairs_metrics.csv"
+        self.pairs_metrics_csv = self.out_dir / f"{s}_{src}_pairs_metrics.csv"
         self.missing_stoic_log = self.out_dir / "missing_stoic_cpxs.txt"
         self.missing_ids_log = self.out_dir / "missing_ids_complexes.txt"
         self.monomer_skip_log = self.out_dir / "monomer_specs_skipped.txt"
@@ -1278,8 +1292,23 @@ def stage_submit_combfold(
             "slurm_job_id": spec_to_job.get(spec),
         })
 
+    # Carry forward any previously-registered entries whose spec isn't part of
+    # this call's df at all (e.g. a --only subset submission, or a complex
+    # list that shrank between runs) -- otherwise rebuilding rows_reg purely
+    # from the current df silently erases their submission history even
+    # though nothing about those specs actually changed.
+    specs_in_df = set(unique_specs) | set(monomer_specs)
+    carried_over = [
+        entry for entry in old_reg.get("combfold_jobs", [])
+        if entry.get("combfold_submission") not in specs_in_df
+    ]
+    if carried_over:
+        print(f"[submit-combfold] carrying forward {len(carried_over)} registry "
+              f"entry(ies) for spec(s) absent from the current expanded_csv "
+              f"(not overwritten by this call).")
+
     reg = load_registry(paths)
-    reg["combfold_jobs"] = rows_reg
+    reg["combfold_jobs"] = rows_reg + carried_over
     reg["combfold_submitted_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     save_registry(paths, reg)
     return submitted_ids
@@ -1311,6 +1340,12 @@ def stage_submit_analyze_dependency(
     self-discovery there fails with "No such file or directory" for
     01_combfold_with_stoic.py. Passing the known-good path explicitly avoids
     relying on spool-relative self-discovery entirely.
+
+    Also passes `paths.setup_name` as a 5th positional arg, so the analyze
+    invocation inside s3_analyze_CF_results.sbatch uses --setup-name explicitly
+    instead of silently falling back to this script's hardcoded SETUP_NAME
+    default (which only happens to match when you never pass --setup-name
+    yourself in the first place).
     """
     if paths.analyze_sh is None or not paths.analyze_sh.exists():
         sys.exit("[submit-analyze] --analyze-sh path does not exist.")
@@ -1333,6 +1368,7 @@ def stage_submit_analyze_dependency(
         str(paths.out_dir),
         source,
         str(paths.this_script),
+        str(paths.setup_name),
     ]
     print(f"[submit-analyze] {' '.join(cmd)}")
     analyze_jid = _submit_sbatch(cmd, "submit-analyze", on_error="exit")
@@ -1626,6 +1662,14 @@ def stage_analyze(paths: Paths, source: str = "pool") -> None:
     agg = pd.read_csv(paths.stoic_agg_csv, dtype=str).fillna("")
     agg_by_cpx: dict[str, dict[str, str]] = {}
     if "cpx_id" in agg.columns:
+        dup_ids = agg["cpx_id"].astype(str)
+        dup_ids = sorted(dup_ids[dup_ids.duplicated(keep=False)].unique())
+        if dup_ids:
+            print(f"[analyze] WARNING: {paths.stoic_agg_csv} has {len(dup_ids)} "
+                  f"duplicated cpx_id value(s) -- only the LAST row per cpx_id "
+                  f"is kept, earlier duplicate row(s) are silently discarded: "
+                  f"{', '.join(dup_ids[:10])}"
+                  f"{', ...' if len(dup_ids) > 10 else ''}", file=sys.stderr)
         for _, arow in agg.iterrows():
             agg_by_cpx[str(arow["cpx_id"])] = dict(arow)
 
