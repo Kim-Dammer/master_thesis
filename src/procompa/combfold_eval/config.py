@@ -52,6 +52,16 @@ class Config:
     )
     cf_confidence_name: str = "confidence.txt"  # cluster_idx:score;... (sorted desc)
 
+    # Stoichiometry-prediction manifest (optional). When set, the pipeline
+    # derives each complex's CombFold output folder from the manifest's
+    # compositions (identifiers + pred_1/2/3) instead of matching folder names
+    # against complex_ac. Needed when CombFold folders are named by UniProt
+    # composition (e.g. P14736x1_P32628x1_pool_output). See manifest.py.
+    manifest_csv: Optional[str] = None
+    # Folder suffixes to look for under combfold_base, in order. Each suffix
+    # that exists on disk for a given composition becomes a separate scored row.
+    cf_folder_suffixes: tuple = ("pool_output", "pair_output")
+
     # ---- Chain / sequence logic -----------------------------------------
     # Minimum polymer length (residues) for a chain to be treated as a real
     # subunit rather than a peptide/tag fragment.

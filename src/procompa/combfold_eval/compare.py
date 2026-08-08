@@ -126,6 +126,8 @@ def _compare_against_form(model_clean: CleanStructure,
         "ref_assembly_id": _ref_assembly_id(form.form_id),
         "is_primary_ref": form.is_primary,
         "ref_select_reason": form.select_reason,
+        "stoich_source": meta.get("stoich_source", ""),
+        "cf_folder_type": meta.get("cf_folder_type", ""),
     }
 
     missing = [u for u in model_comp if model_comp[u] > ref_comp.get(u, 0)]

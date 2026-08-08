@@ -23,8 +23,14 @@ class UniProtSequences:
         # Guards the check-cache -> fetch-REST -> write-cache sequence in get(), so
         # concurrent batch workers requesting the same accession don't race on the
         # same on-disk .fasta cache file (harmless duplicate work at worst, but a
-        # lock makes it a non-issue rather than relying on that).
-        self._lock = threading.Lock()
+        # lock makes it a non-issue rather than relying on that). One lock PER
+        # accession (not one global lock) -- mirrors reference.py's per-pdb_id
+        # `_lock_for` pattern -- so a slow/failing REST call for one accession
+        # never blocks other workers resolving a different, already-cached
+        # accession. `_locks_meta` only guards creation of a new per-accession
+        # lock, not the fetch itself.
+        self._locks: Dict[str, threading.Lock] = {}
+        self._locks_meta = threading.Lock()
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
         if csv_path and os.path.exists(csv_path):
@@ -32,13 +38,14 @@ class UniProtSequences:
 
     def _load_csv(self, csv_path: str) -> None:
         df = pd.read_csv(csv_path)
+        df = df.dropna()
         cols = {c.lower(): c for c in df.columns}
         id_col = cols.get("uniprot_id") or cols.get("uniprot") or list(df.columns)[0]
         seq_col = cols.get("sequence") or cols.get("seq") or list(df.columns)[1]
         for acc, seq in zip(df[id_col].astype(str), df[seq_col].astype(str)):
             acc = acc.strip()
             seq = seq.strip().upper().replace("*", "")
-            if acc and seq and seq.lower() != "nan":
+            if acc and seq:
                 self._seqs[acc] = seq
 
     def _cache_file(self, acc: str) -> Optional[str]:
@@ -62,11 +69,19 @@ class UniProtSequences:
                 fh.write(text)
         return seq
 
+    def _lock_for(self, acc: str) -> threading.Lock:
+        with self._locks_meta:
+            lock = self._locks.get(acc)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[acc] = lock
+            return lock
+
     def get(self, acc: str) -> Optional[str]:
         acc = acc.strip()
         if acc in self._seqs:
             return self._seqs[acc]
-        with self._lock:
+        with self._lock_for(acc):
             # re-check: another thread may have fetched it while we waited for the lock
             if acc in self._seqs:
                 return self._seqs[acc]
