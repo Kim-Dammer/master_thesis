@@ -37,11 +37,11 @@ TASK_ID="${SLURM_ARRAY_TASK_ID:?not running under a SLURM array}"
 
 echo "[$(date)] Task ${TASK_ID}: computing complex_ac slice (chunk_size=${CHUNK_SIZE})..."
 
-COMPLEXES=$(python3 - "$MAPPING" "$TASK_ID" "$CHUNK_SIZE" "${ONLY_FILTER:-}" <<'EOF'
+COMPLEXES=$(python3 - "$MAPPING" "${MANIFEST:-}" "$TASK_ID" "$CHUNK_SIZE" "${ONLY_FILTER:-}" <<'EOF'
 import sys
 import pandas as pd
 
-mapping_path, task_id, chunk_size, only_filter = sys.argv[1:5]
+mapping_path, manifest_path, task_id, chunk_size, only_filter = sys.argv[1:6]
 task_id, chunk_size = int(task_id), int(chunk_size)
 
 df = pd.read_csv(mapping_path)
@@ -51,6 +51,14 @@ if "complex_ac" not in df.columns:
 # independently -- this is what makes disjoint, gap-free chunk slicing work
 # without a shared chunk-list file.
 complexes = sorted(df["complex_ac"].astype(str).str.strip().unique())
+
+# Restrict to complexes present in the manifest -- MUST match s4 exactly.
+if manifest_path:
+    mf = pd.read_csv(manifest_path)
+    if "complex_ac" not in mf.columns:
+        sys.exit("manifest file must have a 'complex_ac' column")
+    manifest_acs = {str(x).strip() for x in mf["complex_ac"]}
+    complexes = [c for c in complexes if c in manifest_acs]
 
 if only_filter:
     keep = {x.strip() for x in only_filter.split(",") if x.strip()}

@@ -81,27 +81,35 @@ REFS_ONLY_ARGS=(--refs-only --mapping "${MAPPING}" --n-workers 16)
 uv run "${SCRIPT}" "${REFS_ONLY_ARGS[@]}"
 
 echo "=== Step 2/3: computing chunk count (chunk_size=${CHUNK_SIZE}) ==="
-N_CHUNKS=$(python3 - "$MAPPING" "$CHUNK_SIZE" "$ONLY_FILTER" <<'EOF'
+N_CHUNKS=$(python3 - "$MAPPING" "$MANIFEST" "$CHUNK_SIZE" "$ONLY_FILTER" <<'EOF'
 import math
 import sys
 
 import pandas as pd
 
-mapping_path, chunk_size, only_filter = sys.argv[1:4]
+mapping_path, manifest_path, chunk_size, only_filter = sys.argv[1:5]
 chunk_size = int(chunk_size)
 
 df = pd.read_csv(mapping_path)
 if "complex_ac" not in df.columns:
     sys.exit("mapping file must have a 'complex_ac' column")
-# Same filtering/sorting logic as s4_submit_combfold_eval_array.sbatch's inline
+# Same filtering/sorting logic as s5_combfold_eval_array.sbatch's inline
 # heredoc -- kept in sync manually since there's no shared chunk-list file;
 # both must agree so this chunk count matches what each array task computes.
 complexes = sorted(df["complex_ac"].astype(str).str.strip().unique())
 
+# Restrict the run to complexes present in the manifest.
+if manifest_path:
+    mf = pd.read_csv(manifest_path)
+    if "complex_ac" not in mf.columns:
+        sys.exit("manifest file must have a 'complex_ac' column")
+    manifest_acs = {str(x).strip() for x in mf["complex_ac"]}
+    complexes = [c for c in complexes if c in manifest_acs]
+
 if only_filter:
     keep = {x.strip() for x in only_filter.split(",") if x.strip()}
     complexes = [c for c in complexes if c in keep]
-
+    
 print(max(1, math.ceil(len(complexes) / chunk_size)))
 EOF
 )

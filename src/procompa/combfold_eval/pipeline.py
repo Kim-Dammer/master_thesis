@@ -52,6 +52,11 @@ from .config import Config
 from .sequences import UniProtSequences
 from .compare import compare_one
 from . import reference as _reference
+from .manifest import (
+    load_manifest,
+    candidate_stoichiometries,
+    resolve_folders,
+)
 
 # UniProt accession pattern (official) + optional xN stoichiometry
 _UNIPROT = r"(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})"
@@ -60,7 +65,8 @@ _ACC_ONLY = re.compile(_UNIPROT)
 _CLUST = re.compile(r"output_clustered_(\d+)\.pdb")
 
 SUMMARY_COLS = [
-    "complex_ac", "pdb_id", "cf_cluster", "cf_rank", "cf_confidence",
+    "complex_ac", "pdb_id", "stoich_source", "cf_folder_type",
+    "cf_cluster", "cf_rank", "cf_confidence",
     "ref_form", "ref_assembly_id", "is_primary_ref",
     "n_shared_subunits", "missing_uniprots", "extra_uniprots",
     "complex_TM_ref", "complex_TM_mod",
@@ -250,6 +256,19 @@ def _process_row(idx: int, row: "pd.Series", cfg: Config, seqs: UniProtSequences
 
     cac = str(row["complex_ac"]).strip()
     pdb = str(row["pdb_id"]).strip()
+    # Manifest-driven provenance (blank on the legacy complex_ac name-matching
+    # path). Injected by run_batch when a manifest resolves this row to a
+    # specific composition folder: `cf_folder_type` is the folder suffix
+    # (pool_output / pair_output) and `stoich_source` is which manifest
+    # composition it came from (identifiers / pred_1 / pred_2 / pred_3). Stamped
+    # onto every emitted row so multiple folders for one complex stay
+    # distinguishable, and used to keep per-complex JSON filenames unique.
+    def _tag(col: str) -> str:
+        return (str(row[col]).strip()
+                if col in row and str(row.get(col)) not in ("nan", "None", "")
+                else "")
+    stoich_source = _tag("stoich_source")
+    cf_folder_type = _tag("cf_folder_type")
     try:
         # ---- locate model(s) ----
         complex_dir = None
@@ -271,7 +290,9 @@ def _process_row(idx: int, row: "pd.Series", cfg: Config, seqs: UniProtSequences
                         models = hits
                         break
         if not models:
-            summary_rows.append(_row_status(cac, pdb, "no_model_found"))
+            summary_rows.append(_row_status(cac, pdb, "no_model_found",
+                                             stoich_source=stoich_source,
+                                             cf_folder_type=cf_folder_type))
             log.append(f"{cac}: no CombFold model found")
             return idx, summary_rows, chain_rows, iface_rows, log
 
@@ -286,7 +307,9 @@ def _process_row(idx: int, row: "pd.Series", cfg: Config, seqs: UniProtSequences
         # ---- candidate UniProts ----
         candidates, csource, stoich = resolve_candidates(row, complex_dir, models[0], seqs)
         if not candidates:
-            summary_rows.append(_row_status(cac, pdb, "no_uniprots_resolved"))
+            summary_rows.append(_row_status(cac, pdb, "no_uniprots_resolved",
+                                             stoich_source=stoich_source,
+                                             cf_folder_type=cf_folder_type))
             log.append(f"{cac}: could not resolve candidate UniProts")
             return idx, summary_rows, chain_rows, iface_rows, log
 
@@ -308,16 +331,28 @@ def _process_row(idx: int, row: "pd.Series", cfg: Config, seqs: UniProtSequences
             res = compare_one(mp, pdb, candidates, cfg, meta=meta, local_au=local_ref)
             for s in res["summary"]:
                 s.setdefault("candidate_source", csource)
+                s["stoich_source"] = stoich_source
+                s["cf_folder_type"] = cf_folder_type
+            for r in res["per_chain"]:
+                r.setdefault("stoich_source", stoich_source)
+                r.setdefault("cf_folder_type", cf_folder_type)
+            for r in res["per_interface"]:
+                r.setdefault("stoich_source", stoich_source)
+                r.setdefault("cf_folder_type", cf_folder_type)
             summary_rows.extend(res["summary"])
             chain_rows.extend(res["per_chain"])
             iface_rows.extend(res["per_interface"])
             if save_json:
-                with open(os.path.join(json_dir, f"{cac}_c{cidx}.json"), "w") as fh:
+                json_stem = (f"{cac}_{stoich_source or 'na'}_{cf_folder_type or 'na'}_c{cidx}"
+                             if (stoich_source or cf_folder_type) else f"{cac}_c{cidx}")
+                with open(os.path.join(json_dir, f"{json_stem}.json"), "w") as fh:
                     json.dump(res["json"], fh, indent=2, default=str)
             log.append(f"{cac} cluster {cidx}: {len(res['summary'])} form(s) scored "
                        f"(candidates from {csource})")
     except Exception as e:  # never abort the whole batch
-        summary_rows.append(_row_status(cac, pdb, "error", flags=str(e)[:200]))
+        summary_rows.append(_row_status(cac, pdb, "error", flags=str(e)[:200],
+                                         stoich_source=stoich_source,
+                                         cf_folder_type=cf_folder_type))
         log.append(f"{cac}: ERROR {type(e).__name__}: {e}")
     return idx, summary_rows, chain_rows, iface_rows, log
 
@@ -349,35 +384,66 @@ def run_batch(cfg: Config, mapping_path: str, seqs: UniProtSequences,
         n_workers = min(8, os.cpu_count() or 4)
     n_workers = max(1, int(n_workers))
 
-    # Select rows to run (order preserved) before dispatching.
-    selected: List[Tuple[int, "pd.Series"]] = []
-    for idx, row in df.iterrows():
+    # ---- Optional manifest-driven folder resolution ---------------------
+    # CombFold output folders can be named by UniProt *composition*
+    # (e.g. P06782x1_P12904x1_P34164x1_pool_output) instead of by complex_ac.
+    # When that happens the complex_ac name-matching in find_complex_dirs()
+    # cannot locate them and every complex reports no_model_found. If a manifest
+    # is configured we translate each complex_ac into its candidate composition
+    # folder(s) -- identifiers + pred_1/2/3, each x cf_folder_suffixes -- and
+    # score every folder that exists on disk as its own work item. Complexes
+    # with no manifest entry (or whose composition folders are absent) fall back
+    # to the original name-matching path.
+    manifest_by_ac: Dict[str, "pd.Series"] = {}
+    if cfg.manifest_csv:
+        manifest_by_ac = load_manifest(cfg.manifest_csv)
+
+    # One complex_ac can now expand into several work items (one per resolved
+    # composition folder), so work items carry their own unique key -- the df
+    # row index is no longer unique across items.
+    work_items: List["pd.Series"] = []
+    for _idx, row in df.iterrows():
         cac = str(row["complex_ac"]).strip()
         if complexes and cac not in complexes:
             continue
-        selected.append((idx, row))
+        mrow = manifest_by_ac.get(cac) if manifest_by_ac else None
+        resolved: List[Tuple[str, str, str]] = []  # (stoich_source, suffix, abs_folder)
+        if mrow is not None:
+            for label, stoich in candidate_stoichiometries(mrow):
+                for suffix, path in resolve_folders(cfg.combfold_base, stoich,
+                                                     cfg.cf_folder_suffixes):
+                    resolved.append((label, suffix, path))
+        if resolved:
+            for label, suffix, path in resolved:
+                r = row.copy()
+                r["folder"] = path            # consumed by find_complex_dirs()
+                r["stoich_source"] = label    # provenance -> output rows + JSON
+                r["cf_folder_type"] = suffix
+                work_items.append(r)
+        else:
+            work_items.append(row)            # legacy name-matching fallback
 
     results: Dict[int, Tuple[List[Dict], List[Dict], List[Dict], List[str]]] = {}
     if n_workers == 1:
-        for idx, row in selected:
-            _, s, c, i, l = _process_row(idx, row, cfg, seqs, json_dir, save_json)
-            results[idx] = (s, c, i, l)
+        for wid, row in enumerate(work_items):
+            _, s, c, i, l = _process_row(wid, row, cfg, seqs, json_dir, save_json)
+            results[wid] = (s, c, i, l)
     else:
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            futures = [ex.submit(_process_row, idx, row, cfg, seqs, json_dir, save_json)
-                       for idx, row in selected]
+            futures = [ex.submit(_process_row, wid, row, cfg, seqs, json_dir, save_json)
+                       for wid, row in enumerate(work_items)]
             for fut in as_completed(futures):
-                idx, s, c, i, l = fut.result()
-                results[idx] = (s, c, i, l)
+                wid, s, c, i, l = fut.result()
+                results[wid] = (s, c, i, l)
 
-    # Reassemble in original mapping-file row order, regardless of completion order,
-    # so output CSVs are identical in row order to the strictly-serial code path.
+    # Reassemble in deterministic dispatch order (mapping-file row order, then
+    # resolved-folder order), regardless of which worker finished first.
     summary_rows: List[Dict] = []
     chain_rows: List[Dict] = []
     iface_rows: List[Dict] = []
     log: List[str] = []
-    for idx, _row in selected:
-        s, c, i, l = results[idx]
+    for wid in range(len(work_items)):
+        s, c, i, l = results[wid]
         summary_rows.extend(s)
         chain_rows.extend(c)
         iface_rows.extend(i)
