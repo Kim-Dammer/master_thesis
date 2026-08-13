@@ -7,6 +7,9 @@
 # own output subfolder.
 #
 # Usage:
+#./s4_submit_combfold_eval.sh \
+#  --combfold-base /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/t11_RM_TM_updated_CF_pipeline/CombFold \
+#  --out-dir /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/t11_RM_TM_updated_CF_pipeline/comfold_eval
 #   ./s4_run_combfold_eval.sh \
 #       --mapping /path/to/mapping.csv \
 #       --combfold-base /path/to/CombFold \
@@ -142,7 +145,7 @@ else
     MERGE_JOB_ID=$(sbatch --parsable \
         --account=es_biol \
         --partition=es_biol \
-        --job-name=combfold_eval_merge \
+        --job-name=cf_eval_merge \
         --dependency="afterok:${JOB_ID}" \
         --kill-on-invalid-dep=yes \
         --cpus-per-task=1 \

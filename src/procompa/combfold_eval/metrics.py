@@ -2,7 +2,7 @@
 
 RMSD is implemented here in NumPy rather than delegated to PyMOL so that every
 choice is explicit and the correspondence is the fixed sequence-based one used by
-the rest of the pipeline. Two variants are reported, mirroring the van Gerwen
+the rest of the pipeline. Two variants are reported,
 PyMOL `align` convention:
   * cycles=0  -> RMSD over ALL co-observed CA (no outlier rejection);
   * cycles=N  -> iterative refinement, rejecting CA pairs deviating > cutoff A

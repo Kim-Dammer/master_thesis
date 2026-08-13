@@ -102,6 +102,7 @@ def _download(url: str, dest: str, timeout: int) -> bool:
 
 
 def _assembly_ids(pdb_id: str, cfg: Config) -> List[str]:
+    """Get assembly ids so we know what to download from pdb apart from the au."""
     url = f"{cfg.rcsb_data_api}/{pdb_id.upper()}"
     try:
         with urllib.request.urlopen(url, timeout=cfg.download_timeout_s) as r:

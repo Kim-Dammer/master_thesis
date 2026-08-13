@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --account=es_biol
 #SBATCH --partition=es_biol
-#SBATCH --job-name=combfold_eval
+#SBATCH --job-name=cf_eval
 #SBATCH --output=logs/combfold_eval_%A_%a.out
 #SBATCH --error=logs/combfold_eval_%A_%a.err
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=3
 #SBATCH --mem-per-cpu=2G
 #SBATCH --time=04:00:00
 #
