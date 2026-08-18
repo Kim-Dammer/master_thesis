@@ -19,15 +19,7 @@ from procompa.combfold_eval.reference import _assembly_ids, _download
 
 logger = logging.getLogger(__name__)
 
-N_WORKERS = 8
-
-'''
-usage: 
-uv run X02_aggregate_combfold_pdb_for_eval.py --cf_results_summary /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/t11_RM_TM_updated_CF_pipeline/all_pdb_present_t11_CF_test_pool_pipeline_complexes_combfold_results.csv
-'''
-
 reference_pdb_dir = Path("/cluster/project/beltrao/kdammer/master_thesis/data/reference_pdb")
-
 cfg = Config()
 
 
@@ -310,7 +302,7 @@ def classify_row(row):
     return cp, _default_model(pdb_stoich), False   # UNKNOWN or AMBIGUOUS
 
 
-def main(combfold_results_csv):
+def main(combfold_results_csv, n_workers=8):
     all_combfold_runs_summary_results = pl.read_csv(
         combfold_results_csv
     )
@@ -335,7 +327,7 @@ def main(combfold_results_csv):
     to_download = set(requested_entries) - available_pdbs
 
     # Download the missing PDBs in parallel
-    with ThreadPoolExecutor(max_workers=N_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = [
             executor.submit(download_pdb, pdb_id, reference_pdb_dir)
             for pdb_id in to_download
@@ -378,6 +370,7 @@ def main(combfold_results_csv):
 
 
 if __name__ == "__main__":
+    
     parser = argparse.ArgumentParser(description="Aggregate CombFold PDB results for evaluation")
     parser.add_argument(
         "--cf_results_summary",
@@ -385,5 +378,11 @@ if __name__ == "__main__":
         required=True,
         help="Path to the combfold results CSV, e.g. Pipeline/t11_RM_TM_updated_CF_pipeline/all_pdb_present_t11_CF_test_pool_pipeline_complexes_combfold_results.csv",
     )
+    parser.add_argument(
+        "--n_workers",
+        type=int,
+        default=8,
+        help="Number of parallel workers for downloading PDBs",
+    )
     args = parser.parse_args()
-    main(combfold_results_csv=args.cf_results_summary)
+    main(combfold_results_csv=args.cf_results_summary, n_workers=args.n_workers)

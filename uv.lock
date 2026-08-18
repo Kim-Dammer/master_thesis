@@ -2658,7 +2658,7 @@ wheels = [
 [[package]]
 name = "pooled-ppi"
 version = "26.0.dev0"
-source = { git = "https://github.com/jurgjn/pooled-ppi?rev=develop#77a5a2bd4ce8aa609a9c60e204b18562533ae4ab" }
+source = { git = "https://github.com/jurgjn/pooled-ppi?rev=develop#ef107ee421b4f30d7b27b4357068f8da475ec5c7" }
 dependencies = [
     { name = "af3io" },
     { name = "biopython" },

@@ -49,11 +49,11 @@ set -euo pipefail
 
 # --- Config -------------------------------------------------
 VENV="/cluster/project/beltrao/kdammer/master_thesis/.venv"
-# Single unified snapshot (26.07) for BOTH homodimers and heteropairs.
+# Single unified snapshot (26.08) for BOTH homodimers and heteropairs.
 # Both read summary_models.parquet (per-sample), ranked by ranking_score.
 # Homodimers honor SOURCE (pair/pool) with cross-source fallback;
 # heteropairs are pool-only (SOURCE ignored).
-POOLED_PPI_DB="/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.07"
+POOLED_PPI_DB="/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.08"
 SEQUENCES_PARQUET="${POOLED_PPI_DB}/proteins.parquet"
 COMBFOLD_SIF="/cluster/project/beltrao/shared/alphafold3/images/combfold_latest.sif"
 OUTPUT_BASE="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/first_setup/CombFold"

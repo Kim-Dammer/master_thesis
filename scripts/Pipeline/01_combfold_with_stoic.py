@@ -80,7 +80,7 @@ from procompa.helpers import clean_identifiers
 # and a pair run against the same --out-dir/--setup-name don't overwrite each
 # other. Override at the command line with --setup-name without editing this
 # file.
-SETUP_NAME = "t11_CF_test"
+SETUP_NAME = "8_benchmark_part_two"
 
 # Raw ComplexPortal column that holds the pipe-separated molecule identifiers.
 MOLECULES_COL = "Identifiers (and stoichiometry) of molecules in complex"
