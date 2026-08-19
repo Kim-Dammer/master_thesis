@@ -1454,7 +1454,7 @@ _PAIR_METRIC_FIELDS = [
     "af3_id1", "af3_id2", "chain_id1", "chain_id2",
     "input_name", "input_type", "batch_id", "seed", "sample",
     "ranking_score", "chain_pair_iptm",
-    "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean",
+    "chain_pair_pae_min", "chain_pair_pae_min_recap",
 ]
 
 

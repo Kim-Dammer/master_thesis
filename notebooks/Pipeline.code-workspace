@@ -4,25 +4,16 @@
 			"path": "../scripts/Pipeline"
 		},
 		{
-			"path": "../data/pdb"
-		},
-		{
 			"path": "../data/Pipeline/7_benchmark_part_one"
-		},
-		{
-			"path": "../tmp"
 		},
 		{
 			"path": "."
 		},
 		{
+			"path": "../scripts"
+		},
+		{
 			"path": "../data/Pipeline/8_benchmark_part_two"
-		},
-		{
-			"path": "../data/complete_complex_pdb_mapping_v2"
-		},
-		{
-			"path": "../data/Pipeline/t11_RM_TM_updated_CF_pipeline"
 		}
 	],
 	"settings": {}

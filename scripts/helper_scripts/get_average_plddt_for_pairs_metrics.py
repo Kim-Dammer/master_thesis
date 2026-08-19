@@ -18,13 +18,14 @@ CSV's other metrics were computed from.
 Requires: pip install -U "pooled-ppi @ git+https://github.com/jurgjn/pooled-ppi@develop"
 
 Usage:
-    uv run get_average_plddt_for_pairs_metrics.py --pairs-csv /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/7_benchmark_part_one/7_benchmark_part_one_pool_pairs_metrics.csv --out-csv /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/7_benchmark_part_one/7_benchmark_part_one_pool_pairs_metrics_with_plddt.csv
+    uv run get_average_plddt_for_pairs_metrics.py --pairs-csv /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/8_benchmark_part_two/combined_pool_pairs_metrics.csv --out-csv /cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/8_benchmark_part_two/combined_pool_pairs_metrics_with_plddt.csv
 """
 
 from __future__ import annotations
  
 import argparse
 import io
+import os
 from pathlib import Path
  
 import numpy as np
@@ -33,17 +34,28 @@ import foldcomp
 from Bio.PDB import PDBParser
 from tqdm import tqdm
 import sqlite_utils
-import pooled_ppi.yeast_pools as yp
- 
+
+# pooled_ppi.yeast_pools.get_data() hardcodes a fallback to data-26.07 when
+# none of /data, /workspace/data, /contents/data exist (true on Euler), so
+# yp.get_path()/yp.get_models() silently resolve to the WRONG snapshot here.
+# Bypass pooled_ppi entirely for path resolution; only the DATA_DIR below
+# needs updating if the snapshot changes again.
+DATA_DIR = Path(os.environ.get(
+    "POOLED_PPI_DATA_DIR",
+    "/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.08"))
+
 CHUNK = 500
 JOIN_KEYS = ["input_name", "sample", "chain_id1", "chain_id2"]
- 
- 
+
+
 def verify_metadata(df: pd.DataFrame) -> None:
     """Assert df's batch_id/sample still match the current summary_models.parquet."""
     input_names = sorted(df["input_name"].astype(str).unique())
     print(f"[verify] reading summary_models.parquet, filtering to {len(input_names)} input_name(s) ...")
-    current = yp.get_models(filters=[("input_name", "in", input_names)])
+    current = pd.read_parquet(
+        DATA_DIR / "summary_models.parquet",
+        filters=[("input_name", "in", input_names)],
+    )
     print(f"[verify] got {len(current)} matching row(s), checking batch_id ...")
     assert "batch_id" in current.columns, "current summary_models.parquet has no batch_id column"
  
@@ -99,7 +111,7 @@ def main() -> None:
     df["db_id1"] = df["input_name"].astype(str) + "_" + df["sample"].astype(str) + "_" + df["chain_id1"].astype(str)
     df["db_id2"] = df["input_name"].astype(str) + "_" + df["sample"].astype(str) + "_" + df["chain_id2"].astype(str)
  
-    models_path = yp.get_path("models.sqlite")
+    models_path = DATA_DIR / "models.sqlite"
     assert models_path.is_file(), f"models.sqlite not found at {models_path}"
     db = sqlite_utils.Database(models_path)
  

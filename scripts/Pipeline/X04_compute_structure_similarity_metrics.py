@@ -542,7 +542,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--max-workers", type=int, default=8, help="Threads for running US-align.")
     parser.add_argument("--mm", type=int, default=1, help="US-align -mm option.")
-    parser.add_argument("--ter", type=int, default=1, help="US-align -ter option.")
+    parser.add_argument("--ter", type=int, default=0,help="US-align -ter option.") 
     parser.add_argument("--skip-existing", action="store_true",
                         help="Skip complexes whose usalign_outputs_pred* dir already exists "
                              "(default: fail, so reruns don't silently mix old and new results).")

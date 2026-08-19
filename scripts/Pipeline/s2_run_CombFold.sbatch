@@ -37,7 +37,7 @@
 #     input_type == 'pool' ONLY (the SOURCE flag is ignored for heteropairs;
 #     the small isolated two-body 'pair' heteropair slice is deliberately
 #     excluded), best model per pair by ranking_score.
-#   The loaded sample's own per-sample PAE (chain_pair_pae_min_{min,max,mean})
+#   The loaded sample's own per-sample PAE (chain_pair_pae_min, chain_pair_pae_min_recap)
 #   is recorded per contact in <run_name>_pairs.csv.
 #
 #   Structures themselves are fetched from a single SQLite DB
@@ -49,7 +49,7 @@ set -euo pipefail
 
 # --- Config -------------------------------------------------
 VENV="/cluster/project/beltrao/kdammer/master_thesis/.venv"
-# Single unified snapshot (26.08) for BOTH homodimers and heteropairs.
+# Single unified snapshot (26.07) for BOTH homodimers and heteropairs.
 # Both read summary_models.parquet (per-sample), ranked by ranking_score.
 # Homodimers honor SOURCE (pair/pool) with cross-source fallback;
 # heteropairs are pool-only (SOURCE ignored).
@@ -375,7 +375,7 @@ if required_homo:
         .select("pair_id", "af3_id1", "af3_id2", "input_type", "input_name",
                 "batch_id", "seed", "sample", "chain_id1", "chain_id2",
                 "ranking_score", "chain_pair_iptm",
-                "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean")
+                "chain_pair_pae_min", "chain_pair_pae_min_recap")
         .collect()
     )
 
@@ -414,9 +414,8 @@ if required_homo:
                         "batch_id": row["batch_id"], "seed": row["seed"],
                         "sample": row["sample"], "ranking_score": row["ranking_score"],
                         "chain_pair_iptm": row["chain_pair_iptm"],
-                        "chain_pair_pae_min_min": row["chain_pair_pae_min_min"],
-                        "chain_pair_pae_min_max": row["chain_pair_pae_min_max"],
-                        "chain_pair_pae_min_mean": row["chain_pair_pae_min_mean"],
+                        "chain_pair_pae_min": row["chain_pair_pae_min"],
+                        "chain_pair_pae_min_recap": row["chain_pair_pae_min_recap"],
                         "status": "written",
                     })
                     break
@@ -438,8 +437,8 @@ if required_homo:
                 "input_type": None, "input_name": None,
                 "batch_id": None, "seed": None,
                 "sample": None, "ranking_score": None, "chain_pair_iptm": None,
-                "chain_pair_pae_min_min": None, "chain_pair_pae_min_max": None,
-                "chain_pair_pae_min_mean": None, "status": "missing",
+                "chain_pair_pae_min": None, "chain_pair_pae_min_recap": None,
+                "status": "missing",
             })
 
     if missing:
@@ -468,7 +467,7 @@ if required_hetero:
         .select("pair_id", "af3_id1", "af3_id2", "input_type", "input_name",
                 "batch_id", "seed", "sample", "chain_id1", "chain_id2",
                 "ranking_score", "chain_pair_iptm",
-                "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean")
+                "chain_pair_pae_min", "chain_pair_pae_min_recap")
         .collect()
     )
 
@@ -501,9 +500,8 @@ if required_hetero:
                     "batch_id": row["batch_id"], "seed": row["seed"],
                     "sample": row["sample"], "ranking_score": row["ranking_score"],
                     "chain_pair_iptm": row["chain_pair_iptm"],
-                    "chain_pair_pae_min_min": row["chain_pair_pae_min_min"],
-                    "chain_pair_pae_min_max": row["chain_pair_pae_min_max"],
-                    "chain_pair_pae_min_mean": row["chain_pair_pae_min_mean"],
+                    "chain_pair_pae_min": row["chain_pair_pae_min"],
+                    "chain_pair_pae_min_recap": row["chain_pair_pae_min_recap"],
                     "status": "written",
                 })
                 break
@@ -523,8 +521,8 @@ if required_hetero:
                 "input_type": None, "input_name": None,
                 "batch_id": None, "seed": None,
                 "sample": None, "ranking_score": None, "chain_pair_iptm": None,
-                "chain_pair_pae_min_min": None, "chain_pair_pae_min_max": None,
-                "chain_pair_pae_min_mean": None, "status": "missing",
+                "chain_pair_pae_min": None, "chain_pair_pae_min_recap": None,
+                "status": "missing",
             })
 
     if missing:
@@ -553,7 +551,7 @@ pairs_csv_cols = [
     "af3_id1", "af3_id2", "chain_id1", "chain_id2",
     "input_type", "input_name", "batch_id", "seed", "sample",
     "ranking_score", "chain_pair_iptm",
-    "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean",
+    "chain_pair_pae_min", "chain_pair_pae_min_recap",
     "status",
 ]
 pairs_csv_path = log_dir / f"{run_name}_pairs.csv"
