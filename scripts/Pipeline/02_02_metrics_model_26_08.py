@@ -17,7 +17,7 @@ PART1_CSV = "/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/7_benc
 PART2_CSV = "/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/8_benchmark_part_two/8_benchmark_part_two_pool_pairs_metrics.csv"
 
 MODELS_PARQUET = "/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.08/summary_models.parquet"
-JOIN_KEYS = ["af3_id1", "af3_id2", "batch_id", "seed", "sample", "input_type"]
+JOIN_KEYS = ["af3_id1", "af3_id2", "batch_id", "seed", "input_name", "sample", "input_type"]
 OLD_METRIC_COLS = {
     "chain_pair_iptm",
     "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean",

@@ -47,7 +47,7 @@ DATA_DIR = os.environ.get(
     "POOLED_PPI_DATA_DIR",
     "/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.08")
 MODELS_PARQUET = f"{DATA_DIR}/summary_models.parquet"
-JOIN_KEYS = ["af3_id1", "af3_id2", "batch_id", "seed", "sample", "input_type"]
+JOIN_KEYS = ["af3_id1", "af3_id2", "batch_id", "seed", "sample", "input_type", "input_name"]
 OLD_METRIC_COLS = {
     "chain_pair_iptm",
     "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean",
