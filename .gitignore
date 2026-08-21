@@ -15,6 +15,10 @@ scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/test_ch
 scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/chunk_analysis_results
 scripts/exploratory/*.csv
 
+scripts/Pipeline/create_interactive_html/CP_benchmark_models
+scripts/Pipeline/create_interactive_html/*.zip
+scripts/Pipeline/create_interactive_html/*.parquet
+scripts/Pipeline/create_interactive_html/*.html
 
 scripts/mmseq_homology_match/mmseqs
 scripts/mmseq_homology_match/all_queries.fasta
