@@ -270,6 +270,26 @@ def _default_model(pdb_stoich):
     return "1" if "1" in pdb_stoich else "au"
 
 
+def _find_match_by_pdb_stoich(row, pdb_stoich):
+    """If Complex portal doent have a stoichiometry that the one from pdb to compare (if this stoichiometry was already run by Stoic CF pipeline)"""
+    asm_keys = sorted((k for k in pdb_stoich if k != "au"), key=int)
+    if "au" in pdb_stoich:
+        asm_keys.append("au")
+    pred_cols = sorted(
+        (c for c in row if c.startswith("pred_") and c[5:].isdigit()),
+        key=lambda c: int(c[5:]),
+    )
+    for asm_key in asm_keys:
+        asm_stoich = pdb_stoich[asm_key]
+        if not isinstance(asm_stoich, dict):
+            continue
+        for col in pred_cols:
+            cf_s = _first_pred_dict(row[col])
+            if isinstance(cf_s, dict) and cf_s == asm_stoich:
+                return asm_stoich, asm_key
+    return None, None    
+
+
 def classify_row(row):
     """-> (CP_stochiometry, reference_pdb_model, found_match_reference_pdb_model)"""
     rank = row["correct_pred_rank"]
@@ -289,6 +309,9 @@ def classify_row(row):
     elif rank_norm in NONE_INPUTS:
         cp = parse_identifiers_to_stoich(row["identifiers"], pdb_id=row.get("pdb_id"))
     elif rank_norm in UNKNOWN_INPUTS:
+        matched_stoich, matched_key = _find_match_by_pdb_stoich(row, pdb_stoich)
+        if matched_key is not None:
+            return matched_stoich, matched_key, True
         cp = UNKNOWN
     else:
         raise ValueError(f"{row.get('pdb_id')}: unexpected correct_pred_rank {rank!r}")

@@ -8,8 +8,8 @@ set -euo pipefail
 VENV="/cluster/project/beltrao/kdammer/master_thesis/.venv"
 source "${VENV}/bin/activate"
 
-CF_RESULTS_CSV="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/8_benchmark_part_two/all_pdb_present_8_benchmark_part_two_pool_pipeline_complexes_combfold_results.csv"
-COMBFOLD_OUTPUT_DIR="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/8_benchmark_part_two/CombFold"
+CF_RESULTS_CSV="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/10_all_CP_complexes/all_pdb_present_10_all_CP_complexes_pool_pipeline_complexes_combfold_results.csv"
+COMBFOLD_OUTPUT_DIR="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/10_all_CP_complexes/CombFold"
 echo "=== X02: aggregate combfold + pdb for eval (login node, n_workers=8) ==="
 python X02_aggregate_combfold_pdb_for_eval.py \
     --cf_results_summary "${CF_RESULTS_CSV}" \

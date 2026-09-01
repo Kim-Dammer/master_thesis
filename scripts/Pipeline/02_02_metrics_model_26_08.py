@@ -13,8 +13,8 @@ consistent source for both.
 import polars as pl
 from tqdm import tqdm
 
-PART1_CSV = "/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/7_benchmark_part_one/7_benchmark_part_one_pool_pairs_metrics.csv"
-PART2_CSV = "/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/8_benchmark_part_two/8_benchmark_part_two_pool_pairs_metrics.csv"
+INPUT_CSV = "/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/10_all_CP_complexes/10_all_CP_complexes_pool_pairs_metrics.csv"  
+OUT_CSV   = INPUT_CSV.replace(".csv", "_26_08_metrics.csv")
 
 MODELS_PARQUET = "/cluster/work/beltrao/jjaenes/25.12_pooled-ppi-yeast/data-26.08/summary_models.parquet"
 JOIN_KEYS = ["af3_id1", "af3_id2", "batch_id", "seed", "input_name", "sample", "input_type"]
@@ -22,33 +22,21 @@ OLD_METRIC_COLS = {
     "chain_pair_iptm",
     "chain_pair_pae_min_min", "chain_pair_pae_min_max", "chain_pair_pae_min_mean",
     "chain_pair_pae_min", "chain_pair_pae_min_recap",
+    "chain_pair_iptm_corrected",
 }
 
-pbar = tqdm(total=7, desc="unify_pair_metrics")
+pbar = tqdm(total=5, desc="unify_pair_metrics")
 
-pbar.set_description("reading csvs")
-part1 = pl.read_csv(PART1_CSV)
-part2 = pl.read_csv(PART2_CSV)
+pbar.set_description("reading csv")
+df = pl.read_csv(INPUT_CSV)
 pbar.update(1)
 
 pbar.set_description("dropping old metrics")
-part1_base = part1.drop([c for c in OLD_METRIC_COLS if c in part1.columns])
-part2_base = part2.drop([c for c in OLD_METRIC_COLS if c in part2.columns])
-assert set(part1_base.columns) == set(part2_base.columns), (
-    f"Column mismatch after dropping metrics: "
-    f"{set(part1_base.columns) ^ set(part2_base.columns)}"
-)
-pbar.update(1)
-
-pbar.set_description("concatenating parts")
-combined_base = pl.concat([part1_base, part2_base], how="vertical")
+base = df.drop([c for c in OLD_METRIC_COLS if c in df.columns])
 pbar.update(1)
 
 pbar.set_description("scanning 26.08 parquet (filtered)")
-# Build the set of exact join-key combos we actually need, so predicate
-# pushdown only reads matching rows instead of the full ~70M-row table.
-needed_keys = combined_base.select(JOIN_KEYS).unique()
-
+needed_keys = base.select(JOIN_KEYS).unique()
 models = (
     pl.scan_parquet(MODELS_PARQUET)
     .select(
@@ -62,23 +50,16 @@ models = (
 pbar.update(1)
 
 pbar.set_description("joining")
-combined = combined_base.join(models, on=JOIN_KEYS, how="left")
+combined = base.join(models, on=JOIN_KEYS, how="left")
 pbar.update(1)
 
-pbar.set_description("checking for unmatched rows")
+pbar.set_description("checking + writing")
 n_missing = combined.filter(pl.col("chain_pair_iptm").is_null()).height
 n_total = combined.height
 tqdm.write(f"{n_missing} / {n_total} rows failed to match against 26.08")
 if n_missing:
-    tqdm.write("WARNING: some rows did not resolve against the 26.08 snapshot - "
-               "inspect these before trusting the combined dataset:")
     tqdm.write(str(combined.filter(pl.col("chain_pair_iptm").is_null()).select(*JOIN_KEYS)))
-pbar.update(1)
-
-
-pbar.set_description("writing output")
-out_path = "/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/8_benchmark_part_two/combined_pool_pairs_metrics.csv"
-combined.write_csv(out_path)
-tqdm.write(f"Wrote unified metrics to {out_path} ({n_total} rows)")
+combined.write_csv(OUT_CSV)
+tqdm.write(f"Wrote {OUT_CSV} ({n_total} rows)")
 pbar.update(1)
 pbar.close()
