@@ -79,6 +79,20 @@ def compress(text: str) -> str:
     return base64.b64encode(gzip.compress(text.encode())).decode()
 
 
+def strip_pdb(text: str) -> str:
+    """Keep only coordinate records, discarding REMARK/HEADER/SEQRES etc.
+
+    AlphaFold2 unrelaxed PDBs embed the full PAE matrix in REMARK 3, which
+    can be 3–10 MB for large proteins. Stripping to ATOM/HETATM/TER/END
+    reduces each pairwise input file to a few hundred KB before gzip, which
+    then compresses to ~50 KB -- essential for keeping the HTML file small."""
+    _KEEP = frozenset({"ATOM", "HETATM", "MODEL", "ENDMDL", "TER", "END"})
+    return "\n".join(
+        line for line in text.splitlines()
+        if line[:6].strip() in _KEEP
+    )
+
+
 def greedy_set_cover(candidates: list, target: frozenset, min_frac: float = 1.0) -> list[str]:
     n_req = ceil(min_frac * len(target)) if target else 0
     covered, selected, pool = frozenset(), [], list(candidates)
@@ -184,6 +198,43 @@ def build_pdb_homology_map(pdb_id: str, homology_lookup: dict, complex_proteins:
         chain: [p for p in prots if p in complex_proteins]
         for chain, prots in homology_lookup.get(pdb_id.lower(), {}).items()
     }
+
+
+def read_input_models(input_folder_name: str, max_pairs: int | None = None) -> list[dict]:
+    """Read, strip, and compress pairwise AlphaFold input PDBs.
+
+    Expects files matching AFM_PROT1_PROT2_unrelaxed_*.pdb under
+    <CF_BASE>/<input_folder_name>/pdbs/.  REMARK blocks are stripped before
+    compression so PAE data (potentially several MB per file) is not embedded.
+    Returns list of dicts: {filename, label, proteins: [p1, p2], pdb_gz}.
+
+    max_pairs: if set, stop after reading this many files (sorted alphabetically)
+    so that large complexes don't bloat the output HTML."""
+    pdbs_dir = CF_BASE / input_folder_name / "pdbs"
+    if not pdbs_dir.exists():
+        return []
+    models: list[dict] = []
+    for pdb_file in sorted(pdbs_dir.glob("*.pdb")):
+        if max_pairs is not None and len(models) >= max_pairs:
+            break
+        m = re.match(r"AFM_([A-Z][A-Z0-9]{5,})_([A-Z][A-Z0-9]{5,})_", pdb_file.name)
+        if not m:
+            continue
+        p1, p2   = m.group(1), m.group(2)
+        proteins = [p1, p2]
+        label    = f"{p1} – {p2}" if p1 != p2 else f"{p1} (homo)"
+        try:
+            text     = pdb_file.read_text()
+            stripped = strip_pdb(text)
+            models.append({
+                "filename": pdb_file.name,
+                "label"   : label,
+                "proteins": proteins,
+                "pdb_gz"  : compress(stripped),
+            })
+        except Exception as e:
+            print(f"  WARNING read input {pdb_file}: {e}", file=sys.stderr)
+    return models
 
 
 def sniff_delimiter(path: Path, default: str = ",") -> str:
@@ -383,6 +434,15 @@ for row in complexes_df.iter_rows(named=True):
                         "folder": m["folder"], "path": m["path"]}
                        for m in best_models]
 
+    # Input pairwise AF models: stripped of REMARK/PAE before compression.
+    input_folder      = best_models[0]["folder"].replace("_pool_output", "_pool_input") if best_models else ""
+    input_models_list = read_input_models(input_folder) if input_folder else []
+    if input_models_list:
+        kb = sum(len(m["pdb_gz"]) for m in input_models_list) // 1024
+        print(f"  Input pairs: {len(input_models_list)} ({kb} KB compressed)")
+    else:
+        print(f"  Input pairs: none found", file=sys.stderr)
+
     EMBED[ac] = {
         "complex_ac"     : ac,
         "identifiers"    : identifiers,
@@ -405,6 +465,7 @@ for row in complexes_df.iter_rows(named=True):
             pid: build_pdb_homology_map(pid, homology_lookup, target)
             for pid in cover
         },
+        "input_models": input_models_list,
     }
 
     # Verify that PDB chain maps are actually populated from SIFTS
@@ -602,6 +663,29 @@ body {
 }
 .pdb-btn:hover { background:#e4e4e4; }
 .pdb-btn.active { background:#0072B2; color:white; border-color:#0072B2; }
+.pdb-btn.cached { border-color:#009E73; }
+
+/* right-panel mode toggle */
+.right-mode-tabs { display:flex; gap:3px; align-items:center; flex-shrink:0; }
+.mode-tab {
+  background:#f0f0f0; border:1px solid #ccc; border-radius:4px;
+  cursor:pointer; padding:2px 9px; font-size:12px; font-weight:600; line-height:1.6;
+  white-space:nowrap;
+}
+.mode-tab:hover:not(.active):not(:disabled) { background:#e4e4e4; }
+.mode-tab.active  { background:#0072B2; color:white; border-color:#0072B2; }
+.mode-tab:disabled { opacity:.38; cursor:not-allowed; }
+
+/* input pair buttons */
+.input-list { display:flex; gap:5px; flex-wrap:wrap; }
+.input-btn {
+  background:#f2f2f2; border:1px solid #ccc; border-radius:4px;
+  cursor:pointer; padding:2px 10px;
+  font-size:12px; font-family:monospace; font-weight:600;
+  max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.input-btn:hover { background:#e4e4e4; }
+.input-btn.active { background:#009E73; color:white; border-color:#009E73; }
 
 .protein-link { cursor:pointer; text-decoration:underline dotted; }
 .protein-link:hover { opacity:.7; }
@@ -666,8 +750,14 @@ body {
 
   <div class="panel">
     <div class="panel-hdr">
-      <h3>PDB Reference</h3>
-      <div class="pdb-list" id="pdb-list"></div>
+      <div class="right-mode-tabs">
+        <button class="mode-tab active" id="tab-pdb"
+                onclick="setRightMode('pdb')">PDB Ref</button>
+        <button class="mode-tab" id="tab-input"
+                onclick="setRightMode('input')">Input Pairs</button>
+      </div>
+      <div class="pdb-list"   id="pdb-list"></div>
+      <div class="input-list" id="input-list" style="display:none"></div>
       <span id="pdb-cap-warning" class="cap-warning"></span>
       <span id="pdb-mapped-summary" class="mapped-summary right"></span>
       <span id="pdb-annotation" class="pdb-annotation"></span>
@@ -729,6 +819,12 @@ let colorMode    = 'single';
 let cfRaw        = null, pdbRaw = null, pdbFmtCur = 'pdb';
 let currentPdbId = null;
 
+/* right-panel input-pair mode */
+let rightMode       = 'pdb';   // 'pdb' | 'input'
+let currentInputIdx = -1;
+let inputRaw        = null;
+let inputChainMap   = {};       // chain letter → UniProt for displayed input model
+
 /* pdbCache: { pid: {text, fmt, title} } -- holds all reference PDBs for the
    CURRENTLY SELECTED complex only. pdbCacheOwner tags which complex_ac
    the cache belongs to; selectComplex() resets both on every switch, and
@@ -739,6 +835,156 @@ let currentPdbId = null;
    exists for that PDB. */
 let pdbCache      = {};
 let pdbCacheOwner = null;
+
+/* ── right-panel mode: PDB Ref ↔ Input Pairs ─────────────────────────── */
+function setRightMode(mode) {
+  rightMode = mode;
+  document.getElementById('tab-pdb').classList.toggle('active',   mode === 'pdb');
+  document.getElementById('tab-input').classList.toggle('active',  mode === 'input');
+  document.getElementById('pdb-list').style.display    = mode === 'pdb'   ? '' : 'none';
+  document.getElementById('input-list').style.display  = mode === 'input' ? '' : 'none';
+  document.getElementById('pdb-cap-warning').style.display = mode === 'pdb' ? '' : 'none';
+  document.getElementById('pdb-mapped-summary').innerHTML = '';
+
+  if (mode === 'pdb') {
+    // restore CF coloring to the current color-mode
+    if (cfRaw) styleViewer(cfV, cfRaw, 'pdb', 'cf');
+    // restore current reference PDB (use cache if available)
+    if (currentPdbId && pdbCache[currentPdbId]) {
+      const {text, fmt} = pdbCache[currentPdbId];
+      styleViewer(pdbV, text, fmt, 'pdb');
+    } else if (currentPdbId) {
+      loadPDB(currentPdbId);
+    }
+    updateAnnotations();
+    updateMappedSummaries();
+  } else {
+    const models = cur?.input_models || [];
+    buildInputList(models);
+    if (models.length > 0) {
+      loadInputModel(0);
+    } else {
+      pdbV.removeAllModels(); pdbV.render();
+      spin('pdb-overlay', true, 'No input models embedded for this complex.');
+      setTimeout(() => spin('pdb-overlay', false), 4000);
+    }
+    updateAnnotations();
+  }
+}
+
+function buildInputList(models) {
+  const list = document.getElementById('input-list');
+  list.innerHTML = '';
+  models.forEach((m, i) => {
+    const b = document.createElement('button');
+    b.className   = 'input-btn';
+    b.textContent = m.label;
+    b.title       = m.filename;
+    b.onclick     = () => loadInputModel(i);
+    list.appendChild(b);
+  });
+}
+
+async function loadInputModel(idx) {
+  const models = cur?.input_models || [];
+  if (!cur || idx < 0 || idx >= models.length) return;
+  currentInputIdx = idx;
+
+  document.querySelectorAll('.input-btn')
+    .forEach((b, i) => b.classList.toggle('active', i === idx));
+
+  const m = models[idx];
+  spin('pdb-overlay', true, 'Loading input pair...');
+  try {
+    const text = await ungzip(m.pdb_gz);
+    inputRaw   = text;
+
+    /* chain-letter → UniProt: chains in appearance order → proteins[0], proteins[1] */
+    const chains = [...new Set(
+      text.split('\n')
+        .filter(l => l.startsWith('ATOM') && l.length > 21)
+        .map(l => l[21])
+    )];
+    inputChainMap = {};
+    chains.forEach((ch, i) => {
+      inputChainMap[ch] = m.proteins[Math.min(i, m.proteins.length - 1)];
+    });
+
+    styleInputViewer(text, m.proteins);
+    spin('pdb-overlay', false);
+    if (cfRaw) highlightCFPair(m.proteins);
+    updateAnnotations();
+    updateMappedSummaries();
+  } catch (e) {
+    console.error(e);
+    spin('pdb-overlay', true, 'Failed to load: ' + e.message);
+    setTimeout(() => spin('pdb-overlay', false), 3500);
+  }
+}
+
+/* Color the input-pair viewer: chain A → blue, chain B → green (both blue
+   for homodimers).  These colors are intentionally never yellow so the
+   pair is always distinguishable from the rest of the CF assembly. */
+function styleInputViewer(text, proteins) {
+  pdbV.removeAllModels();
+  const model  = pdbV.addModel(text, 'pdb');
+  const chains = [...new Set(model.selectedAtoms({}).map(a => a.chain))].sort();
+  const homo   = proteins[0] === proteins[1];
+
+  chains.forEach((ch, i) => {
+    const color = homo ? CC[0] : (i === 0 ? CC[0] : CC[2]); // blue / green
+    pdbV.setStyle({chain: ch}, {cartoon: {color}});
+  });
+
+  pdbV.setHoverable({}, true,
+    (atom, v) => {
+      const u = inputChainMap[atom.chain];
+      v.removeAllLabels();
+      v.addLabel(
+        u ? 'Chain ' + atom.chain + ': ' + u : 'Chain ' + atom.chain,
+        {...LABEL_STYLE, position: atom}
+      );
+      v.render();
+    },
+    (atom, v) => { v.removeAllLabels(); v.render(); }
+  );
+
+  pdbV.zoomTo(); pdbV.render();
+}
+
+/* Highlight CF assembly chains that belong to the selected input pair,
+   using the SAME colors as the right-panel input viewer so chains can be
+   matched by color across both panels:
+     proteins[0] chains → blue  (CC[0])
+     proteins[1] chains → green (CC[2])   (or blue too if homodimer)
+     all other chains   → yellow (YELLOW) — fully visible, just distinguished */
+function highlightCFPair(proteins) {
+  if (!cfRaw) return;
+  const homo = proteins[0] === proteins[1];
+
+  cfV.removeAllModels();
+  const model  = cfV.addModel(cfRaw, 'pdb');
+  const chains = [...new Set(model.selectedAtoms({}).map(a => a.chain))].sort();
+
+  chains.forEach(ch => {
+    const u = cur?.cf_chain_map?.[ch];
+    let color;
+    if (homo && u === proteins[0]) {
+      color = CC[0];    // homodimer: all copies blue
+    } else if (u === proteins[0]) {
+      color = CC[0];    // blue — matches right-panel chain A
+    } else if (u === proteins[1]) {
+      color = CC[2];    // green — matches right-panel chain B
+    } else {
+      color = YELLOW;   // rest of complex: visible but clearly distinct
+    }
+    cfV.setStyle({chain: ch}, {cartoon: {color}});
+  });
+
+  cfV.setHoverable({}, true, cfHoverCB, cfUnhoverCB);
+  cfV.zoomTo(); cfV.render();
+  updateMappedSummaries();
+}
 
 /* ── viewers + hover ──────────────────────────────────────────────────── */
 /* Hover callbacks are named + module-level so styleViewer() can re-register
@@ -936,6 +1182,21 @@ function updateMappedSummaries() {
   const cfEl  = document.getElementById('cf-mapped-summary');
   const pdbEl = document.getElementById('pdb-mapped-summary');
   cfEl.innerHTML = ''; pdbEl.innerHTML = '';
+
+  if (rightMode === 'input') {
+    /* In input mode the CF panel is in "pair highlight" mode; show which
+       proteins are highlighted rather than the full by-mapping breakdown. */
+    if (currentInputIdx >= 0) {
+      const m = (cur?.input_models || [])[currentInputIdx];
+      if (m) {
+        const unique = [...new Set(m.proteins)];
+        cfEl.innerHTML =
+          '<span class="m-blue">Highlighted: ' + unique.join(' \u2013 ') + '</span>';
+      }
+    }
+    return;
+  }
+
   if (!cur || colorMode !== 'by-mapping') return;
 
   const pdbProts      = cur.pdb_proteins?.[currentPdbId] || [];
@@ -975,6 +1236,14 @@ function updateAnnotations() {
   const cfEl  = document.getElementById('cf-annotation');
   const pdbEl = document.getElementById('pdb-annotation');
   cfEl.textContent = cur?.cp_annotation ? cur.cp_annotation : '(no Complex Portal annotation)';
+
+  if (rightMode === 'input') {
+    const m = (cur?.input_models || [])[currentInputIdx];
+    pdbEl.textContent = m
+      ? 'Input pair: ' + m.label + '  [' + m.filename + ']'
+      : '(no input pair selected)';
+    return;
+  }
 
   const cpAnnot   = cur?.pdb_annotation?.[currentPdbId];
   const rcsbTitle = pdbCache[currentPdbId]?.title;
@@ -1110,6 +1379,22 @@ function selectComplex(ac) {
   cur = COMPLEXES[ac];
   if (!cur) return;
 
+  /* reset right-panel mode every time we switch complexes */
+  rightMode       = 'pdb';
+  currentInputIdx = -1;
+  inputRaw        = null;
+  inputChainMap   = {};
+  document.getElementById('tab-pdb').classList.add('active');
+  document.getElementById('tab-input').classList.remove('active');
+  document.getElementById('pdb-list').style.display    = '';
+  document.getElementById('input-list').style.display  = 'none';
+  document.getElementById('pdb-cap-warning').style.display = '';
+  /* enable/disable Input Pairs tab based on availability */
+  const hasInputs = (cur.input_models || []).length > 0;
+  document.getElementById('tab-input').disabled = !hasInputs;
+  document.getElementById('tab-input').title    =
+    hasInputs ? '' : 'No input models embedded for this complex';
+
   pdbCache      = {};   // drop previous complex's cache
   pdbCacheOwner = ac;
 
@@ -1207,6 +1492,12 @@ document.getElementById('scr-page').onclick = function() {
 
 document.getElementById('color-mode').onchange = function() {
   colorMode = this.value;
+  if (rightMode === 'input') {
+    /* In input mode the CF viewer is in pair-highlight mode; changing the
+       color dropdown shouldn't override it.  It will take effect when the
+       user returns to PDB Ref mode. */
+    return;
+  }
   if (cfRaw)  styleViewer(cfV,  cfRaw,  'pdb',     'cf');
   if (pdbRaw) styleViewer(pdbV, pdbRaw, pdbFmtCur, 'pdb');
 };

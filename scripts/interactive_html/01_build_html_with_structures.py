@@ -15,8 +15,8 @@ import polars as pl
 import gemmi
 from scipy.stats import spearmanr
 
-PARQUET = "both_parts_benchmark_structure_similarity.parquet"
-OUT_HTML = "tm_vs_cf_with_structures.html"
+PARQUET = "/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/10_all_CP_complexes/cf_pdb_structure_similarity/cf_pdb_eval_all_metrics_benchmark_bigger_complexes.parquet"
+OUT_HTML = "tm_vs_cf_with_structures_entire_benchmark.html"
 
 
 import gzip
