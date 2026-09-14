@@ -375,6 +375,7 @@ if required_homo:
         .select("pair_id", "af3_id1", "af3_id2", "input_type", "input_name",
                 "batch_id", "seed", "sample", "chain_id1", "chain_id2",
                 "ranking_score", "chain_pair_iptm",
+                "chain_pair_iptm_expected", "chain_pair_iptm_corrected",
                 "chain_pair_pae_min", "chain_pair_pae_min_recap")
         .collect()
     )
@@ -414,6 +415,8 @@ if required_homo:
                         "batch_id": row["batch_id"], "seed": row["seed"],
                         "sample": row["sample"], "ranking_score": row["ranking_score"],
                         "chain_pair_iptm": row["chain_pair_iptm"],
+                        "chain_pair_iptm_expected": row["chain_pair_iptm_expected"],
+                        "chain_pair_iptm_corrected": row["chain_pair_iptm_corrected"],
                         "chain_pair_pae_min": row["chain_pair_pae_min"],
                         "chain_pair_pae_min_recap": row["chain_pair_pae_min_recap"],
                         "status": "written",
@@ -437,6 +440,7 @@ if required_homo:
                 "input_type": None, "input_name": None,
                 "batch_id": None, "seed": None,
                 "sample": None, "ranking_score": None, "chain_pair_iptm": None,
+                "chain_pair_iptm_expected": None, "chain_pair_iptm_corrected": None,
                 "chain_pair_pae_min": None, "chain_pair_pae_min_recap": None,
                 "status": "missing",
             })
@@ -467,6 +471,7 @@ if required_hetero:
         .select("pair_id", "af3_id1", "af3_id2", "input_type", "input_name",
                 "batch_id", "seed", "sample", "chain_id1", "chain_id2",
                 "ranking_score", "chain_pair_iptm",
+                "chain_pair_iptm_expected", "chain_pair_iptm_corrected",
                 "chain_pair_pae_min", "chain_pair_pae_min_recap")
         .collect()
     )
@@ -500,6 +505,8 @@ if required_hetero:
                     "batch_id": row["batch_id"], "seed": row["seed"],
                     "sample": row["sample"], "ranking_score": row["ranking_score"],
                     "chain_pair_iptm": row["chain_pair_iptm"],
+                    "chain_pair_iptm_expected": row["chain_pair_iptm_expected"],
+                    "chain_pair_iptm_corrected": row["chain_pair_iptm_corrected"],
                     "chain_pair_pae_min": row["chain_pair_pae_min"],
                     "chain_pair_pae_min_recap": row["chain_pair_pae_min_recap"],
                     "status": "written",
@@ -521,6 +528,7 @@ if required_hetero:
                 "input_type": None, "input_name": None,
                 "batch_id": None, "seed": None,
                 "sample": None, "ranking_score": None, "chain_pair_iptm": None,
+                "chain_pair_iptm_expected": None, "chain_pair_iptm_corrected": None,
                 "chain_pair_pae_min": None, "chain_pair_pae_min_recap": None,
                 "status": "missing",
             })
@@ -551,6 +559,7 @@ pairs_csv_cols = [
     "af3_id1", "af3_id2", "chain_id1", "chain_id2",
     "input_type", "input_name", "batch_id", "seed", "sample",
     "ranking_score", "chain_pair_iptm",
+    "chain_pair_iptm_expected", "chain_pair_iptm_corrected",
     "chain_pair_pae_min", "chain_pair_pae_min_recap",
     "status",
 ]
@@ -587,12 +596,14 @@ EOF
 # ---- Step 2: Run CombFold via Singularity ------------------
 echo "[$(date)] Running CombFold for ${RUN_NAME}..."
 
+MODIFIED_SCRIPT="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/13_all_CP_complexes_plddt_70_threshold/run_on_pdbs_t70.py"
+
 singularity exec \
     --bind "${OUTPUT_BASE}" \
+    --bind "${MODIFIED_SCRIPT}:/app/CombFold/scripts/run_on_pdbs.py" \
     "${COMBFOLD_SIF}" \
     sh -c "python /app/CombFold/scripts/run_on_pdbs.py \
     ${SUBUNITS_JSON} \
     ${PDBS_DIR} \
     ${OUTPUT_DIR}"
-
 echo "[$(date)] CombFold finished. Output in: ${OUTPUT_DIR}"

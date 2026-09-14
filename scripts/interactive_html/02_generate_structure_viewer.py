@@ -18,7 +18,6 @@ currently selected reference PDB.
 Output: data/CP_complexes_no_struct_coverage/structure_viewer.html
 """
 import base64, gzip, json, re, sys
-from math import ceil
 from pathlib import Path
 
 import polars as pl
@@ -27,12 +26,13 @@ from procompa import get_project_root
 PRJ_ROOT = get_project_root()
 DATA     = PRJ_ROOT / "data"
 CF_BASE  = DATA / "Pipeline/10_all_CP_complexes/CombFold"
-OUT      = DATA / "CP_complexes_no_struct_coverage/structure_viewer.html"
+OUT      = DATA / "Pipeline/viewer/02_structure_viewer_plddt_80_max_identity_greedy.html"
 MMSEQ    = DATA / "CP_complexes_no_struct_coverage/sanity_checks/mmseq_no_Strcut_filtered.parquet"
 ANNOT    = DATA / "CP_complexes_no_struct_coverage/complex_pdb_annotations_map.csv"
 
 MAX_PDB_REFS = 20  # safeguard cap on reference PDBs shown per complex
 MMSEQ_RAW = PRJ_ROOT / "scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_new_identity_similarity_max_sensitivity.parquet"
+SET_COVER_PARQUET = DATA / "CP_complexes_no_struct_coverage/minimal_complex_pdb_set_cover_max_identity.parquet"
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -92,18 +92,6 @@ def strip_pdb(text: str) -> str:
         if line[:6].strip() in _KEEP
     )
 
-
-def greedy_set_cover(candidates: list, target: frozenset, min_frac: float = 1.0) -> list[str]:
-    n_req = ceil(min_frac * len(target)) if target else 0
-    covered, selected, pool = frozenset(), [], list(candidates)
-    while len(covered) < n_req and pool:
-        i = max(range(len(pool)), key=lambda j: len(pool[j][1] - covered))
-        pdb, prots = pool.pop(i)
-        if not (new := prots - covered):
-            break
-        covered |= new
-        selected.append(pdb)
-    return selected
 
 
 def read_chain_list(folder_name: str) -> dict[str, str] | None:
@@ -266,6 +254,21 @@ pdb_hits = pl.read_parquet(
     DATA / "CP_complexes_no_struct_coverage/complex_pdb_hits.parquet"
 )
 
+print("Loading precomputed PDB set cover...")
+assert SET_COVER_PARQUET.exists(), f"Set cover parquet not found: {SET_COVER_PARQUET}"
+_sc = pl.read_parquet(SET_COVER_PARQUET)
+assert {"complex_ac", "cover_100_pdbs", "cover_75_pdbs"}.issubset(set(_sc.columns)), (
+    f"Set cover parquet missing expected columns; got {_sc.columns}"
+)
+cover_lookup: dict[str, dict[str, list[str]]] = {
+    r["complex_ac"]: {
+        "cover_100": r["cover_100_pdbs"] or [],
+        "cover_75":  r["cover_75_pdbs"]  or [],
+    }
+    for r in _sc.iter_rows(named=True)
+}
+print(f"  {len(cover_lookup)} complexes with precomputed cover")
+
 # Complex Portal annotations: complex-level name + per-PDB description.
 # Coverage is partial by design (not every reference PDB has an entry) --
 # lookups below must return None cleanly for missing pairs, not raise.
@@ -404,18 +407,16 @@ for row in complexes_df.iter_rows(named=True):
     else:
         print(f"  WARNING: no CF models found", file=sys.stderr)
 
-    # PDB set cover -- IDs only, browser fetches on demand
-    hits = pdb_hits.filter(pl.col("complex_ac") == ac)
-    candidates = []
+    # PDB set cover -- precomputed; IDs only, browser fetches on demand
+    _ac_cover = cover_lookup.get(ac, {})
+    cover = _ac_cover.get("cover_100") or _ac_cover.get("cover_75") or []
+
+    # pdb_proteins: still needed for the embed (maps each cover PDB -> proteins)
     pdb_proteins: dict[str, list[str]] = {}
+    hits = pdb_hits.filter(pl.col("complex_ac") == ac)
     for h in hits.iter_rows(named=True):
         if h["pdb_id"] and h["proteins"]:
-            candidates.append((h["pdb_id"], frozenset(h["proteins"])))
             pdb_proteins[h["pdb_id"]] = list(h["proteins"])
-
-    cover = greedy_set_cover(candidates, frozenset(target), min_frac=1.0)
-    if not cover:
-        cover = greedy_set_cover(candidates, frozenset(target), min_frac=0.75)
 
     pdb_cap_hit = len(cover) > MAX_PDB_REFS
     if pdb_cap_hit:
@@ -1473,7 +1474,7 @@ document.getElementById('scr-page').onclick = function() {
   html2canvas(document.documentElement, {
     useCORS: true,
     allowTaint: true,
-    scale: window.devicePixelRatio || 1,
+    scale: 3,
     width:        window.innerWidth,
     height:       window.innerHeight,
     windowWidth:  window.innerWidth,

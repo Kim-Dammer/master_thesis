@@ -80,7 +80,7 @@ from procompa.helpers import clean_identifiers
 # and a pair run against the same --out-dir/--setup-name don't overwrite each
 # other. Override at the command line with --setup-name without editing this
 # file.
-SETUP_NAME = "11_CP_complexes_para_swap"
+SETUP_NAME = "13_CP_complexes_plddt_70_threshold"
 
 # Raw ComplexPortal column that holds the pipe-separated molecule identifiers.
 MOLECULES_COL = "Identifiers (and stoichiometry) of molecules in complex"
@@ -1454,9 +1454,9 @@ _PAIR_METRIC_FIELDS = [
     "af3_id1", "af3_id2", "chain_id1", "chain_id2",
     "input_name", "input_type", "batch_id", "seed", "sample",
     "ranking_score", "chain_pair_iptm",
+    "chain_pair_iptm_expected", "chain_pair_iptm_corrected",
     "chain_pair_pae_min", "chain_pair_pae_min_recap",
 ]
-
 
 def _stoichiometry_given(identifiers: str) -> bool | None:
     """User-provided semantics on the RAW ComplexPortal identifiers string.
