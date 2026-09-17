@@ -348,7 +348,7 @@ def save_pair_pdb(fc_key1: str, fc_key2: str, out_path: Path) -> bool:
 
 missing_any = False
 
-# --- Homodimers: 26.07 summary_models.parquet, pair/pool selectable via SOURCE ---
+
 # --- Homodimers: 26.07 summary_models.parquet, pair/pool selectable via SOURCE ---
 if required_homo:
     required_homo_keys = {f"{lo}__{hi}" for lo, hi in required_homo}

@@ -15,6 +15,8 @@ scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/test_ch
 scripts/af3-template-analysis_from_ubnAF3Benchmark/af3-template-analysis/chunk_analysis_results
 scripts/exploratory/*.csv
 
+scripts/homomultimer_pool_pair_comparison/homomultimer_analzsis_dataframes
+
 scripts/Pipeline/create_interactive_html/CP_benchmark_models
 scripts/Pipeline/create_interactive_html/*.zip
 scripts/Pipeline/create_interactive_html/*.parquet

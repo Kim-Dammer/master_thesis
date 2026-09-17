@@ -18,21 +18,24 @@ currently selected reference PDB.
 Output: data/CP_complexes_no_struct_coverage/structure_viewer.html
 """
 import base64, gzip, json, re, sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import polars as pl
+from tqdm import tqdm
 from procompa import get_project_root
 
 PRJ_ROOT = get_project_root()
 DATA     = PRJ_ROOT / "data"
 CF_BASE  = DATA / "Pipeline/10_all_CP_complexes/CombFold"
-OUT      = DATA / "Pipeline/viewer/02_structure_viewer_plddt_80_max_identity_greedy.html"
+OUT      = DATA / "Pipeline/viewer/02_structure_viewer_visualize_plddt_80.html"
 MMSEQ    = DATA / "CP_complexes_no_struct_coverage/sanity_checks/mmseq_no_Strcut_filtered.parquet"
 ANNOT    = DATA / "CP_complexes_no_struct_coverage/complex_pdb_annotations_map.csv"
 
-MAX_PDB_REFS = 20  # safeguard cap on reference PDBs shown per complex
+MAX_PDB_REFS    = 20   # safeguard cap on reference PDBs shown per complex
+MAX_INPUT_PAIRS = 15   # safeguard cap on embedded pairwise AF models per complex
 MMSEQ_RAW = PRJ_ROOT / "scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_new_identity_similarity_max_sensitivity.parquet"
-SET_COVER_PARQUET = DATA / "CP_complexes_no_struct_coverage/minimal_complex_pdb_set_cover_max_identity.parquet"
+SET_COVER_PARQUET = DATA / "CP_complexes_no_struct_coverage/minimal_complex_pdb_set_cover_max_identity.parquet"  #greddy pdb approach, but with max identity sort
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -200,13 +203,20 @@ def read_input_models(input_folder_name: str, max_pairs: int | None = None) -> l
     so that large complexes don't bloat the output HTML."""
     pdbs_dir = CF_BASE / input_folder_name / "pdbs"
     if not pdbs_dir.exists():
+        print(f"  WARNING no input pdbs/ dir at {pdbs_dir} -- "
+              f"Input Pairs tab will be empty for this complex", file=sys.stderr)
         return []
+    all_pdb_files = sorted(pdbs_dir.glob("*.pdb"))
     models: list[dict] = []
-    for pdb_file in sorted(pdbs_dir.glob("*.pdb")):
+    unmatched = 0
+    for pdb_file in all_pdb_files:
         if max_pairs is not None and len(models) >= max_pairs:
+            print(f"  WARNING input pairs capped at {max_pairs} "
+                  f"(found {len(all_pdb_files)} files in {pdbs_dir})", file=sys.stderr)
             break
         m = re.match(r"AFM_([A-Z][A-Z0-9]{5,})_([A-Z][A-Z0-9]{5,})_", pdb_file.name)
         if not m:
+            unmatched += 1
             continue
         p1, p2   = m.group(1), m.group(2)
         proteins = [p1, p2]
@@ -222,6 +232,11 @@ def read_input_models(input_folder_name: str, max_pairs: int | None = None) -> l
             })
         except Exception as e:
             print(f"  WARNING read input {pdb_file}: {e}", file=sys.stderr)
+    if unmatched:
+        print(f"  WARNING {unmatched}/{len(all_pdb_files)} files in {pdbs_dir} "
+              f"did not match the AFM_<P1>_<P2>_ naming pattern -- "
+              f"check for a different filename convention on large complexes",
+              file=sys.stderr)
     return models
 
 
@@ -345,19 +360,37 @@ for d in CF_BASE.iterdir():
         all_folders[d.name] = (d / "assembled_results", models)
 print(f"  {len(all_folders)} folders with assembled results")
 
+# Index folders by protein so per-complex matching is O(candidates) instead
+# of O(all_folders). Previously folder_proteins() (a regex scan) ran once
+# per complex PER FOLDER -- for many complexes against many folders this
+# dominated runtime. Now it's computed once per folder, and per-complex
+# lookup only has to check folders that actually share a protein with the
+# complex, via an inverted index -- same result set as the full scan
+# (still verified with the `fp <= target` subset check below), just far
+# fewer candidates to check.
+print("Indexing CombFold folders by protein (for fast complex matching)...")
+folder_proteins_cache: dict[str, frozenset[str]] = {
+    fname: frozenset(folder_proteins(fname)) for fname in all_folders
+}
+protein_to_folders: dict[str, list[str]] = {}
+for fname, fp in folder_proteins_cache.items():
+    for p in fp:
+        protein_to_folders.setdefault(p, []).append(fname)
+print(f"  indexed {len(protein_to_folders)} distinct proteins across folders")
+
 
 # ── process each complex ──────────────────────────────────────────────────────
 
 EMBED: dict[str, dict] = {}
 
-for row in complexes_df.iter_rows(named=True):
+def process_complex(row: dict) -> tuple[str, dict]:
     ac          = row["complex_ac"]
     identifiers = row["identifiers"]
     cf_max      = float(row["CF_confidence_max"])
     match_class = row["match_class"] or "unknown"
     target      = uniprot_proteins(identifiers)
 
-    print(f"\n{ac}  CF={cf_max:.1f}  {match_class}  ({len(target)} proteins)")
+    log = [f"\n{ac}  CF={cf_max:.1f}  {match_class}  ({len(target)} proteins)"]
 
     best_models: list[dict] = []
     best_label  = ""
@@ -378,21 +411,28 @@ for row in complexes_df.iter_rows(named=True):
                         "path"     : str(m["path"]),
                     })
                 except Exception as e:
-                    print(f"  WARNING read {m['path']}: {e}", file=sys.stderr)
+                    log.append(f"  WARNING read {m['path']}: {e}")
         return candidate
 
-    # Pass 1: protein-set match (exact or folder subset of target)
-    for fname, (assembled, models) in all_folders.items():
-        fp    = folder_proteins(fname)
+    # Pass 1: protein-set match (exact or folder subset of target).
+    # Only folders sharing at least one protein with `target` can possibly
+    # satisfy `fp <= target` (fp non-empty), so the inverted index narrows
+    # the scan to just those instead of walking every folder.
+    candidate_fnames = set()
+    for p in target:
+        candidate_fnames.update(protein_to_folders.get(p, []))
+    for fname in candidate_fnames:
+        fp = folder_proteins_cache[fname]
+        assembled, models = all_folders[fname]
         delta = abs(models[0]["score"] - cf_max)
-        if (fp == target or (fp and fp <= target)) and delta < best_delta:
+        if fp and fp <= target and delta < best_delta:
             candidate = read_models(fname, models)
             if candidate:
                 best_delta, best_label, best_models = delta, folder_stoic_label(fname), candidate
 
     # Pass 2: score-only fallback (large complexes with truncated folder names)
     if not best_models:
-        print(f"  no protein-set match -- trying score-only fallback")
+        log.append(f"  no protein-set match -- trying score-only fallback")
         for fname, (assembled, models) in all_folders.items():
             delta = abs(models[0]["score"] - cf_max)
             if delta < best_delta:
@@ -403,9 +443,9 @@ for row in complexes_df.iter_rows(named=True):
                     best_models = candidate
 
     if best_models:
-        print(f"  CF models: {len(best_models)}  delta={best_delta:.3f}  [{best_label[:60]}]")
+        log.append(f"  CF models: {len(best_models)}  delta={best_delta:.3f}  [{best_label[:60]}]")
     else:
-        print(f"  WARNING: no CF models found", file=sys.stderr)
+        log.append(f"  WARNING: no CF models found")
 
     # PDB set cover -- precomputed; IDs only, browser fetches on demand
     _ac_cover = cover_lookup.get(ac, {})
@@ -420,10 +460,10 @@ for row in complexes_df.iter_rows(named=True):
 
     pdb_cap_hit = len(cover) > MAX_PDB_REFS
     if pdb_cap_hit:
-        print(f"  WARNING {ac}: PDB cover has {len(cover)} entries, "
-              f"capping at {MAX_PDB_REFS}", file=sys.stderr)
+        log.append(f"  WARNING {ac}: PDB cover has {len(cover)} entries, "
+                   f"capping at {MAX_PDB_REFS}")
     cover = cover[:MAX_PDB_REFS]
-    print(f"  PDB cover: {cover}")
+    log.append(f"  PDB cover: {cover}")
 
     cf_chain_map    = best_models[0].get("chain_map", {}) if best_models else {}
     if best_models:
@@ -436,15 +476,24 @@ for row in complexes_df.iter_rows(named=True):
                        for m in best_models]
 
     # Input pairwise AF models: stripped of REMARK/PAE before compression.
+    # Capped defensively -- large complexes (many chains) can have a large
+    # number of required pairwise predictions, and each embedded pair adds
+    # to the output HTML's size, so an uncapped read risks bloating/slowing
+    # the page precisely for the large complexes where this was reported broken.
     input_folder      = best_models[0]["folder"].replace("_pool_output", "_pool_input") if best_models else ""
-    input_models_list = read_input_models(input_folder) if input_folder else []
+    input_models_list = read_input_models(input_folder, max_pairs=MAX_INPUT_PAIRS) if input_folder else []
+    if input_folder and not (CF_BASE / input_folder).exists():
+        log.append(f"  WARNING expected input folder does not exist: {CF_BASE / input_folder} "
+                   f"(derived from CF folder {best_models[0]['folder']!r} by suffix swap -- "
+                   f"if the real folder is named differently for large complexes, this is why "
+                   f"Input Pairs is empty)")
     if input_models_list:
         kb = sum(len(m["pdb_gz"]) for m in input_models_list) // 1024
-        print(f"  Input pairs: {len(input_models_list)} ({kb} KB compressed)")
+        log.append(f"  Input pairs: {len(input_models_list)} ({kb} KB compressed)")
     else:
-        print(f"  Input pairs: none found", file=sys.stderr)
+        log.append(f"  Input pairs: none found")
 
-    EMBED[ac] = {
+    entry = {
         "complex_ac"     : ac,
         "identifiers"    : identifiers,
         "cf_confidence"  : cf_max,
@@ -471,13 +520,29 @@ for row in complexes_df.iter_rows(named=True):
 
     # Verify that PDB chain maps are actually populated from SIFTS
     if cover:
-        mapped = [pid for pid in cover if EMBED[ac]["pdb_chain_map"].get(pid)]
+        mapped = [pid for pid in cover if entry["pdb_chain_map"].get(pid)]
         assert mapped, (
             f"No PDB chain maps populated for {ac} (PDB IDs: {cover}). "
             f"Check that SIFTS covers these PDB entries."
         )
-    if EMBED[ac]["cp_annotation"] is None:
-        print(f"  NOTE: no Complex Portal annotation found for {ac}", file=sys.stderr)
+    if entry["cp_annotation"] is None:
+        log.append(f"  NOTE: no Complex Portal annotation found for {ac}")
+
+    tqdm.write("\n".join(log))
+    return ac, entry
+
+
+# I/O-bound (file reads, gzip compression releases the GIL) and each complex
+# is independent, so this parallelizes cleanly -- mirrors the
+# ThreadPoolExecutor(max_workers=16) pattern used elsewhere in this pipeline.
+# executor.map preserves input order, so EMBED still ends up sorted by
+# CF_confidence_max descending (same dropdown order as before), regardless
+# of which complex's thread happens to finish first.
+_rows = list(complexes_df.iter_rows(named=True))
+with ThreadPoolExecutor(max_workers=16) as executor:
+    for ac, entry in tqdm(executor.map(process_complex, _rows), total=len(_rows),
+                           desc="Assembling complexes"):
+        EMBED[ac] = entry
 
 
 # ── detailed per-protein evidence (for click-to-inspect in the viewer) ─────
@@ -618,6 +683,26 @@ body {
 .color-ctrl select {
   padding:2px 6px; border:1px solid #ccc; border-radius:4px; font-size:12px;
 }
+.plddt-ctrl {
+  display:flex; align-items:center; gap:6px; font-weight:normal;
+  white-space:nowrap; font-size:12px;
+}
+.plddt-ctrl input[type=range] { width:100px; vertical-align:middle; }
+.plddt-ctrl input[type=number] {
+  width:46px; font-family:monospace; padding:1px 3px;
+  border:1px solid #ccc; border-radius:3px; font-size:12px;
+}
+.plddt-ctrl input:disabled { opacity:.4; }
+.plddt-mode-label {
+  display:flex; align-items:center; gap:3px; cursor:pointer;
+}
+.plddt-mode-label input[type=radio] { margin:0; cursor:pointer; }
+.plddt-legend {
+  display:flex; align-items:center; gap:4px; font-size:11px; color:#666;
+}
+.plddt-legend .sw {
+  display:inline-block; width:9px; height:9px; border-radius:2px;
+}
 .panels {
   display:grid; grid-template-columns:1fr 1fr;
   gap:8px; flex:1; min-height:0;
@@ -727,7 +812,27 @@ body {
       <option value="single"    >Single (yellow)</option>
       <option value="by-chain"  >By chain</option>
       <option value="by-mapping">By mapping</option>
+      <option value="plddt"     >By pLDDT</option>
     </select>
+  </div>
+  <div class="plddt-legend" id="plddt-legend" style="display:none">
+    <span class="sw" style="background:#0053D6"></span>&gt;90
+    <span class="sw" style="background:#65CBF3"></span>70-90
+    <span class="sw" style="background:#FFDB13"></span>50-70
+    <span class="sw" style="background:#FF7D45"></span>&lt;50
+  </div>
+  <div class="plddt-ctrl">
+    <label class="plddt-mode-label">
+      <input type="radio" name="plddt-mode" value="threshold" id="plddt-mode-threshold" checked>
+      pLDDT &ge;
+    </label>
+    <input type="range" id="plddt-threshold" min="0" max="100" step="1" value="0">
+    <input type="number" id="plddt-threshold-num" min="0" max="100" step="1" value="0">
+    <label class="plddt-mode-label">
+      <input type="radio" name="plddt-mode" value="top50" id="plddt-mode-top50">
+      Top 50% per chain
+    </label>
+    <span style="color:#999">(AF models only)</span>
   </div>
 </div>
 
@@ -816,9 +921,74 @@ async function ungzip(b64) {
 
 /* ── state ────────────────────────────────────────────────────────────── */
 let cfV=null, pdbV=null, cur=null, mIdx=0;
-let colorMode    = 'single';
+let colorMode      = 'single';
+let plddtThreshold = 0;          // hide atoms with pLDDT (B-factor) below this, AF models only
+let plddtMode      = 'threshold'; // 'threshold' (fixed value, slider or typed) | 'top50' (per-chain median split)
 let cfRaw        = null, pdbRaw = null, pdbFmtCur = 'pdb';
 let currentPdbId = null;
+
+/* ── pLDDT (AlphaFold DB standard 4-bin palette) ─────────────────────────
+   Applies to B-factor columns of AF3 models (CombFold assembly, input
+   pairwise predictions) where B-factor was overloaded to store pLDDT.
+   NOT meaningful for real crystallographic reference PDBs -- never
+   applied there. */
+function plddtColor(atom) {
+  const b = atom.b;
+  if (b == null)  return GRAY;
+  if (b > 90)     return '#0053D6';
+  if (b > 70)     return '#65CBF3';
+  if (b > 50)     return '#FFDB13';
+  return '#FF7D45';
+}
+
+/* Hide (clear style on) atoms whose B-factor/pLDDT falls below the active
+   cutoff, on top of whatever cartoon style/coloring was just applied.
+   Must be called AFTER setStyle for the visible atoms, since setStyle
+   with an empty style object here overrides them for the hidden subset.
+   Dispatches on the global plddtMode -- see applyThresholdFilter (fixed
+   cutoff, from slider or typed number) and applyTop50Filter (per-chain
+   median split) below. */
+function applyPlddtFilter(v) {
+  if (plddtMode === 'top50') applyTop50Filter(v);
+  else                       applyThresholdFilter(v, plddtThreshold);
+}
+
+/* Fixed cutoff: hide any atom with pLDDT < threshold. No-op at 0. */
+function applyThresholdFilter(v, threshold) {
+  if (!threshold) return;
+  const below = v.selectedAtoms({}).filter(a => a.b != null && a.b < threshold);
+  if (below.length) {
+    v.setStyle({serial: below.map(a => a.serial)}, {});
+  }
+}
+
+/* Per-chain "top 50%": for each chain independently, compute the median
+   pLDDT (B-factor) across that chain's atoms and hide whichever atoms
+   fall below it -- i.e. keep only the upper half of each chain's own
+   pLDDT distribution. Computed per chain (not globally) so a uniformly
+   confident chain doesn't get needlessly thinned out just because
+   another chain in the same model is worse, and vice versa. */
+function applyTop50Filter(v) {
+  const atoms = v.selectedAtoms({}).filter(a => a.b != null);
+  if (!atoms.length) return;
+
+  const byChain = {};
+  atoms.forEach(a => (byChain[a.chain] ||= []).push(a.b));
+
+  const chainMedian = {};
+  for (const [ch, vals] of Object.entries(byChain)) {
+    vals.sort((x, y) => x - y);
+    const mid = vals.length >> 1;
+    chainMedian[ch] = (vals.length % 2)
+      ? vals[mid]
+      : (vals[mid - 1] + vals[mid]) / 2;
+  }
+
+  const below = atoms.filter(a => a.b < chainMedian[a.chain]);
+  if (below.length) {
+    v.setStyle({serial: below.map(a => a.serial)}, {});
+  }
+}
 
 /* right-panel input-pair mode */
 let rightMode       = 'pdb';   // 'pdb' | 'input'
@@ -933,16 +1103,24 @@ function styleInputViewer(text, proteins) {
   const homo   = proteins[0] === proteins[1];
 
   chains.forEach((ch, i) => {
+    if (colorMode === 'plddt') {
+      pdbV.setStyle({chain: ch}, {cartoon: {colorfunc: plddtColor}});
+      return;
+    }
     const color = homo ? CC[0] : (i === 0 ? CC[0] : CC[2]); // blue / green
     pdbV.setStyle({chain: ch}, {cartoon: {color}});
   });
 
+  /* Input pairs are AF3 predictions too -- B-factor is pLDDT, filter applies. */
+  applyPlddtFilter(pdbV);
+
   pdbV.setHoverable({}, true,
     (atom, v) => {
       const u = inputChainMap[atom.chain];
+      const plddt = atom.b != null ? '  |  pLDDT ' + atom.b.toFixed(1) : '';
       v.removeAllLabels();
       v.addLabel(
-        u ? 'Chain ' + atom.chain + ': ' + u : 'Chain ' + atom.chain,
+        (u ? 'Chain ' + atom.chain + ': ' + u : 'Chain ' + atom.chain) + plddt,
         {...LABEL_STYLE, position: atom}
       );
       v.render();
@@ -982,6 +1160,8 @@ function highlightCFPair(proteins) {
     cfV.setStyle({chain: ch}, {cartoon: {color}});
   });
 
+  applyPlddtFilter(cfV);
+
   cfV.setHoverable({}, true, cfHoverCB, cfUnhoverCB);
   cfV.zoomTo(); cfV.render();
   updateMappedSummaries();
@@ -998,9 +1178,10 @@ function highlightCFPair(proteins) {
    styleViewer below). */
 function cfHoverCB(atom, viewer) {
   const u = cur?.cf_chain_map?.[atom.chain];
+  const plddt = atom.b != null ? '  |  pLDDT ' + atom.b.toFixed(1) : '';
   viewer.removeAllLabels();
   viewer.addLabel(
-    u ? 'Chain ' + atom.chain + ': ' + u : 'Chain ' + atom.chain + ' (unmapped)',
+    (u ? 'Chain ' + atom.chain + ': ' + u : 'Chain ' + atom.chain + ' (unmapped)') + plddt,
     {...LABEL_STYLE, position: atom}
   );
   viewer.render();
@@ -1014,6 +1195,9 @@ function pdbHoverCB(atom, viewer) {
   if (info) text += ' | SIFTS: ' + info.u + (info.cp ? ' (direct match)' : ' (not in complex)');
   if (homology && homology.length > 0) text += ' | homology: ' + homology.join(', ');
   if (!info && (!homology || homology.length === 0)) text += ' (no mapping)';
+  /* This is a crystallographic reference structure, so B-factor here is a
+     real B-factor, not pLDDT -- labeled accordingly to avoid confusion. */
+  if (atom.b != null) text += '  |  B-factor ' + atom.b.toFixed(1);
   viewer.removeAllLabels();
   viewer.addLabel(text, {...LABEL_STYLE, position: atom});
   viewer.render();
@@ -1042,7 +1226,10 @@ function styleViewer(v, text, fmt, storeAs) {
 
   chains.forEach((ch, i) => {
     let color;
-    if (colorMode === 'by-chain') {
+    if (colorMode === 'plddt') {
+      v.setStyle({chain:ch}, {cartoon:{colorfunc: plddtColor}});
+      return;
+    } else if (colorMode === 'by-chain') {
       color = CC[i % CC.length];
     } else if (colorMode === 'single') {
       color = YELLOW;
@@ -1075,6 +1262,11 @@ function styleViewer(v, text, fmt, storeAs) {
     }
     v.setStyle({chain:ch}, {cartoon:{color}});
   });
+
+  /* pLDDT threshold filter only makes sense for AF3-derived models; the
+     CF assembly panel always is one, the reference PDB panel (crystal
+     structures, real B-factors) never is. */
+  if (storeAs === 'cf') applyPlddtFilter(v);
 
   v.zoomTo(); v.render();
   updateMappedSummaries();
@@ -1493,15 +1685,63 @@ document.getElementById('scr-page').onclick = function() {
 
 document.getElementById('color-mode').onchange = function() {
   colorMode = this.value;
+  document.getElementById('plddt-legend').style.display =
+    colorMode === 'plddt' ? '' : 'none';
   if (rightMode === 'input') {
-    /* In input mode the CF viewer is in pair-highlight mode; changing the
-       color dropdown shouldn't override it.  It will take effect when the
-       user returns to PDB Ref mode. */
+    /* In input mode the right panel is showing an input pair (already
+       colorable by pLDDT via loadInputModel/styleInputViewer below), and
+       the CF viewer is in pair-highlight mode which never follows the
+       color dropdown. Re-render just the input pair so a switch to/from
+       'plddt' takes effect immediately. */
+    if (currentInputIdx >= 0) loadInputModel(currentInputIdx);
     return;
   }
   if (cfRaw)  styleViewer(cfV,  cfRaw,  'pdb',     'cf');
   if (pdbRaw) styleViewer(pdbV, pdbRaw, pdbFmtCur, 'pdb');
 };
+
+/* Re-render whatever pLDDT-filterable panel(s) are currently visible,
+   after either the cutoff value or the filter mode changes. Reference
+   PDB (crystal) panel intentionally NOT refiltered -- see applyPlddtFilter
+   note; it never carries pLDDT data in the first place. */
+function refilterAfterPlddtChange() {
+  if (rightMode === 'input') {
+    if (currentInputIdx >= 0) loadInputModel(currentInputIdx); // re-decompress + refilter
+    else if (cfRaw) styleViewer(cfV, cfRaw, 'pdb', 'cf');
+  } else {
+    if (cfRaw) styleViewer(cfV, cfRaw, 'pdb', 'cf');
+  }
+}
+
+/* Slider and number box are two views onto the same plddtThreshold value
+   -- keep them in sync so the user can drag OR type, whichever's handy. */
+function setThresholdValue(raw) {
+  plddtThreshold = Math.max(0, Math.min(100, Number(raw) || 0));
+  document.getElementById('plddt-threshold').value     = plddtThreshold;
+  document.getElementById('plddt-threshold-num').value = plddtThreshold;
+}
+
+document.getElementById('plddt-threshold').oninput = function() {
+  setThresholdValue(this.value);
+  refilterAfterPlddtChange();
+};
+document.getElementById('plddt-threshold-num').oninput = function() {
+  setThresholdValue(this.value);
+  refilterAfterPlddtChange();
+};
+
+/* Fixed-threshold vs. top-50%-per-chain mode toggle. The slider/number
+   box are only meaningful in 'threshold' mode, so disable (not hide --
+   keeps the layout stable) whichever control isn't active. */
+document.querySelectorAll('input[name="plddt-mode"]').forEach(radio => {
+  radio.onchange = function() {
+    plddtMode = this.value;
+    const isThreshold = plddtMode === 'threshold';
+    document.getElementById('plddt-threshold').disabled     = !isThreshold;
+    document.getElementById('plddt-threshold-num').disabled = !isThreshold;
+    refilterAfterPlddtChange();
+  };
+});
 
 /* ── init ─────────────────────────────────────────────────────────────── */
 initViewers();
