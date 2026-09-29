@@ -11,8 +11,8 @@
 
 # --- Slurm Settings ---
 #SBATCH --job-name=mmseqs_search
-#SBATCH --time=5:00:00
-#SBATCH --cpus-per-task=8
+#SBATCH --time=10:00:00
+#SBATCH --cpus-per-task=10
 #SBATCH --mem-per-cpu=8G
 #SBATCH --output=slurm_logs/mmseqs_%j.out
 #SBATCH --error=slurm_logs/mmseqs_%j.err
@@ -22,10 +22,10 @@ set -euo pipefail
 # --- USER CONFIGURATION ---
 # Combined query FASTA, already built by build_query_fasta_from_json.py, e.g.:
 #   python build_query_fasta_from_json.py --input_dir .../data --output all_queries.fasta
-QUERY_FASTA="/cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/all_CP_proteins_sequences.fasta"
+QUERY_FASTA="/cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/all_CF_YM_yeast_proteins.fasta"
 
 # Where to write mmseqs2 databases and results
-WORK_DIR="/cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity"
+WORK_DIR="/cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/YM_CP_combined"
 
 PDB_SEQRES_PATH="/cluster/project/beltrao/kdammer/master_thesis/data/pdb/pdb_seqres.txt"
 

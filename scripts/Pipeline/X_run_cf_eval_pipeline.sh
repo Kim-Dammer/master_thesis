@@ -1,6 +1,5 @@
 #!/bin/bash
-# Run this directly on the LOGIN node (not via sbatch):
-# Runs X02 here (needs internet: RCSB downloads + API), then submits
+# Run directly on the LOGIN node with bash - Runs X02 here (needs internet: RCSB downloads + API), then submits
 # X_submit_cf_eval_STEPS_3_4.sbatch to a compute node for X03 + X04.
 
 set -euo pipefail
@@ -8,8 +7,8 @@ set -euo pipefail
 VENV="/cluster/project/beltrao/kdammer/master_thesis/.venv"
 source "${VENV}/bin/activate"
 
-CF_RESULTS_CSV="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/10_all_CP_complexes/all_pdb_present_10_all_CP_complexes_pool_pipeline_complexes_combfold_results.csv"
-COMBFOLD_OUTPUT_DIR="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/10_all_CP_complexes/CombFold"
+CF_RESULTS_CSV="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/17_CP_model_based_on_ptm_avg/all_pdb_present_17_CP_model_based_on_ptm_avg_pool_pipeline_complexes_combfold_results.csv"
+COMBFOLD_OUTPUT_DIR="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/17_CP_model_based_on_ptm_avg/CombFold"
 echo "=== X02: aggregate combfold + pdb for eval (login node, n_workers=8) ==="
 python X02_aggregate_combfold_pdb_for_eval.py \
     --cf_results_summary "${CF_RESULTS_CSV}" \

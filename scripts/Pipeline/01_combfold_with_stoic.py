@@ -80,7 +80,7 @@ from procompa.helpers import clean_identifiers
 # and a pair run against the same --out-dir/--setup-name don't overwrite each
 # other. Override at the command line with --setup-name without editing this
 # file.
-SETUP_NAME = "13_CP_complexes_plddt_70_threshold"
+SETUP_NAME = "18_CP_model_based_on_pae"
 
 # Raw ComplexPortal column that holds the pipe-separated molecule identifiers.
 MOLECULES_COL = "Identifiers (and stoichiometry) of molecules in complex"
@@ -1179,7 +1179,7 @@ def stage_expand(paths: Paths, top_n: int = 10) -> None:
 # ===========================================================================
 
 def stage_submit_combfold(
-    paths: Paths, dry_run: bool = False, source: str = "pool", force: bool = False
+    paths: Paths, dry_run: bool = False, source: str = "pool", force: bool = False, metric: str = "ranking_score"
 ) -> list[int]:
     """Submit one CombFold sbatch per unique combfold_submission spec.
 
@@ -1261,7 +1261,7 @@ def stage_submit_combfold(
     spec_to_job: dict[str, int | None] = {}
     submitted_ids: list[int] = []
     for spec in to_submit:
-        cmd = ["sbatch", str(patched_sh), spec, source]
+        cmd = ["sbatch", f"--export=ALL,METRIC={metric}", str(patched_sh), spec, source]
         if dry_run:
             print(f"[DRY-RUN] {' '.join(cmd)}")
             spec_to_job[spec] = None
@@ -1384,7 +1384,7 @@ def stage_submit_analyze_dependency(
 # ===========================================================================
 
 def stage_submit_post_stoic_chain(
-    paths: Paths, stoic_job_id: int, top_n: int = 10, source: str = "pool"
+    paths: Paths, stoic_job_id: int, top_n: int = 10, source: str = "pool", metric: str = "ranking_score"
 ) -> None:
     """Submit a single sbatch (--dependency=afterok:stoic_job_id) that runs
     aggregate-stoic + expand + submit-combfold + (submit-analyze dependency).
@@ -1409,6 +1409,7 @@ def stage_submit_post_stoic_chain(
         f"    --analyze-sh {paths.analyze_sh} \\\n"
         f"    --top-n {top_n} \\\n"
         f"    --combfold-source {source} \\\n"
+        f"    --metric {metric} \\\n"
         f"    --mode post-stoic-chain\n"
     )
     chain_sh.chmod(0o755)
@@ -1884,6 +1885,10 @@ def main() -> None:
                          "or timed out (default: skip specs already attempted).")
     ap.add_argument("--combfold-source", choices=["pair", "pool"], default="pool",
                     help="SOURCE arg passed to the CombFold sbatch (default pool).")
+    ap.add_argument("--metric", choices=["ranking_score", "pae", "iptm", "ptm_avg"],
+                default="ranking_score",
+                help="Model-selection metric, forwarded to the CombFold sbatch "
+                     "as an env var (default ranking_score).")
     ap.add_argument(
         "--mode",
         choices=[
@@ -1937,8 +1942,8 @@ def main() -> None:
         if not paths.expanded_csv.exists():
             sys.exit("[submit-combfold] expanded.csv missing; run --mode expand first.")
         ids = stage_submit_combfold(paths, dry_run=args.dry_run,
-                                    source=args.combfold_source,
-                                    force=args.force_combfold)
+                            source=args.combfold_source,
+                            force=args.force_combfold, metric=args.metric)
         if args.analyze_sh and not args.dry_run:
             stage_submit_analyze_dependency(paths, ids, source=args.combfold_source)
 
@@ -1950,7 +1955,7 @@ def main() -> None:
         stage_aggregate_stoic(paths, max_preds=args.top_n)
         stage_expand(paths, top_n=args.top_n)
         ids = stage_submit_combfold(paths, source=args.combfold_source,
-                                    force=args.force_combfold)
+                            force=args.force_combfold, metric=args.metric)
         if ids:
             if args.analyze_sh:
                 stage_submit_analyze_dependency(paths, ids, source=args.combfold_source)
@@ -1974,7 +1979,7 @@ def main() -> None:
             stage_aggregate_stoic(paths, max_preds=args.top_n)
             stage_expand(paths, top_n=args.top_n)
             ids = stage_submit_combfold(paths, source=args.combfold_source,
-                                        force=args.force_combfold)
+                            force=args.force_combfold, metric=args.metric)
             if ids:
                 if args.analyze_sh:
                     stage_submit_analyze_dependency(paths, ids, source=args.combfold_source)
@@ -1992,7 +1997,7 @@ def main() -> None:
             if not stoic_jid:
                 sys.exit("[all] No stoic_job_id in registry; cannot chain.")
             stage_submit_post_stoic_chain(paths, stoic_jid, top_n=args.top_n,
-                                          source=args.combfold_source)
+                              source=args.combfold_source, metric=args.metric)
             print(f"\n[all] Submitted Stoic job {stoic_jid} and dependent chain. "
                   f"Monitor with squeue; final CSV will appear at:\n  {paths.final_csv}")
 
