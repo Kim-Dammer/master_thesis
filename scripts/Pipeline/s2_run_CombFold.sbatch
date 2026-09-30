@@ -105,6 +105,17 @@ OUTPUT_BASE="/cluster/project/beltrao/kdammer/master_thesis/data/Pipeline/first_
 # which is what 01_combfold_with_stoic.py's --metric flag does). Defaults to
 # 'iptm' if not exported at all (e.g. a manual sbatch call).
 METRIC="${METRIC:-iptm}"
+
+# PLDDT_TRIM_CUTOFF: trim low-confidence termini of every chain in every
+# pairwise PDB before handing it to CombFold. From each end, residues are
+# removed while their CA pLDDT (B-factor) is < cutoff; trimming stops at the
+# first residue whose CA pLDDT >= cutoff. Interior low-pLDDT regions are kept.
+# Residue numbering is NOT changed, so residues still line up with the
+# full-length sequence in subunits.json. Set to 0 to disable trimming.
+# Read from environment so it can be overridden via sbatch --export.
+PLDDT_TRIM_CUTOFF="${PLDDT_TRIM_CUTOFF:-50}"
+# 1 = also write the untrimmed pair PDBs to <run>_input/pdbs_untrimmed/
+SAVE_UNTRIMMED_PDBS="${SAVE_UNTRIMMED_PDBS:-1}"
 # ------------------------------------------------------------
 
 source "${VENV}/bin/activate"
@@ -146,10 +157,11 @@ echo "Spec: ${SPEC}"
 echo "Source: ${SOURCE}"
 echo "Metric: ${METRIC}"
 echo "Top N models per pair: ${TOP_N_MODELS}"
+echo "pLDDT terminal trim cutoff: ${PLDDT_TRIM_CUTOFF}"
 
 mkdir -p logs
 
-export SPEC SOURCE METRIC TOP_N_MODELS OUTPUT_BASE SEQUENCES_PARQUET POOLED_PPI_DB
+export SPEC SOURCE METRIC TOP_N_MODELS OUTPUT_BASE SEQUENCES_PARQUET POOLED_PPI_DB PLDDT_TRIM_CUTOFF SAVE_UNTRIMMED_PDBS
 
 # --- Recompute complex name on bash side (no temp file) -----
 COMPLEX_NAME=$(python -c "
@@ -219,6 +231,8 @@ output_base = os.environ["OUTPUT_BASE"]
 sequences_path = os.environ["SEQUENCES_PARQUET"]
 pooled_ppi_db = os.environ["POOLED_PPI_DB"]
 job_id = os.environ.get("SLURM_JOB_ID", "unknown")
+plddt_trim_cutoff = float(os.environ.get("PLDDT_TRIM_CUTOFF", "0"))
+save_untrimmed = os.environ.get("SAVE_UNTRIMMED_PDBS", "1") == "1"
 
 # ============================================================
 # MODEL SELECTION -- how "best" is defined for METRIC.
@@ -464,7 +478,52 @@ def _fetch_pdb_str(db: sqlite_utils.Database, id_: str) -> str | None:
     return pdb_str
 
 
-def save_pair_pdb(fc_key1: str, fc_key2: str, out_path: Path) -> bool:
+def trim_low_plddt_termini(chain, cutoff: float, label: str) -> tuple[int, int]:
+    """Remove residues from both termini of `chain` (in place) while their CA
+    pLDDT (stored in the B-factor column) is < cutoff. Stops at the first
+    residue from each end whose CA pLDDT >= cutoff. Residues without a CA
+    count as low-confidence. Residue numbering is left untouched.
+
+    Returns (n_removed_N_term, n_removed_C_term). If NO residue passes the
+    cutoff, the chain is left untrimmed (so CombFold still gets the subunit)
+    and a warning is printed.
+    """
+    if cutoff <= 0:
+        return 0, 0
+    residues = list(chain)
+    if not residues:
+        return 0, 0
+
+    ca_b = [r["CA"].get_bfactor() for r in residues if "CA" in r]
+    # Sanity check on pLDDT scale: AF3 writes 0-100. A 0-1 scale would make
+    # every residue fall below 50 and silently trigger the 'keep all' path.
+    if ca_b and max(ca_b) <= 1.0:
+        print(f"ERROR: {label}: max CA B-factor is {max(ca_b):.3f} -- pLDDT looks "
+              f"like it is on a 0-1 scale, but cutoff={cutoff} assumes 0-100.")
+        sys.exit(1)
+
+    ok = [("CA" in r) and (r["CA"].get_bfactor() >= cutoff) for r in residues]
+    if not any(ok):
+        print(f"  WARNING: {label}: no CA with pLDDT >= {cutoff}; keeping chain untrimmed.")
+        return 0, 0
+
+    first = ok.index(True)
+    last = len(ok) - 1 - ok[::-1].index(True)
+    for r in residues[:first] + residues[last + 1:]:
+        chain.detach_child(r.id)
+    n_n, n_c = first, len(residues) - 1 - last
+    if n_n or n_c:
+        kept = residues[first:last + 1]
+        print(f"  trimmed {label}: -{n_n} N-term, -{n_c} C-term "
+              f"(kept res {kept[0].id[1]}-{kept[-1].id[1]}, {len(kept)}/{len(residues)})")
+    return n_n, n_c
+
+
+def save_pair_pdb(fc_key1: str, fc_key2: str, out_path: Path) -> dict | None:
+    """Fetch both chains, merge them into one 2-chain structure (unchanged
+    coordinates), optionally save an untrimmed copy, then trim low-pLDDT
+    termini of each chain independently and write the PDB CombFold reads.
+    Returns per-chain trim counts, or None if a chain is missing from SQLite."""
     db = _get_sqlite_db()
     parser = Bio.PDB.PDBParser(QUIET=True)
     struct0 = None
@@ -473,7 +532,7 @@ def save_pair_pdb(fc_key1: str, fc_key2: str, out_path: Path) -> bool:
     ):
         pdb_str = _fetch_pdb_str(db, id_)
         if pdb_str is None:
-            return False
+            return None
         struct = parser.get_structure(index, io.StringIO(pdb_str))
         if index == 0:
             struct0 = struct
@@ -481,10 +540,24 @@ def save_pair_pdb(fc_key1: str, fc_key2: str, out_path: Path) -> bool:
             chain0 = next(struct[0].get_chains())
             chain0.id = chain_id
             struct0[0].add(chain0)
+
     pdbio = Bio.PDB.PDBIO()
+    if save_untrimmed and plddt_trim_cutoff > 0:
+        # MUST be outside pdbs/ -- CombFold reads every PDB in that folder.
+        untrimmed_dir = out_path.parent.parent / "pdbs_untrimmed"
+        untrimmed_dir.mkdir(exist_ok=True)
+        pdbio.set_structure(struct0)
+        pdbio.save(str(untrimmed_dir / out_path.name))
+
+    trim_info = {}
+    for index, (chain, id_) in enumerate(zip(list(struct0[0]), [fc_key1, fc_key2])):
+        n_n, n_c = trim_low_plddt_termini(chain, plddt_trim_cutoff, id_)
+        trim_info[f"trim_nterm_chain{index + 1}"] = n_n
+        trim_info[f"trim_cterm_chain{index + 1}"] = n_c
+
     pdbio.set_structure(struct0)
     pdbio.save(str(out_path))
-    return True
+    return trim_info
 
 missing_any = False
 
@@ -531,7 +604,8 @@ if required_homo:
             fc_key2 = f"{row['input_name']}_{row['sample']}_{row['chain_id2']}"
             n_written += 1
             path_pdb = pdbs_dir / f"AFM_{orig1}_{orig2}_unrelaxed_rank_{n_written}_model_{n_written}.pdb"
-            if save_pair_pdb(fc_key1, fc_key2, path_pdb):
+            trim_info = save_pair_pdb(fc_key1, fc_key2, path_pdb)
+            if trim_info is not None:
                 seen_rows.add(row_key)
                 print(f" written ({n_written}/{top_n_models}): {path_pdb} (type={source}, "
                       f"sample={row['sample']}, {metric}={row[SORT_COL]:.3f}, "
@@ -552,6 +626,8 @@ if required_homo:
                     "chain_pair_pae_min": row["chain_pair_pae_min"],
                     "chain_pair_pae_min_recap": row["chain_pair_pae_min_recap"],
                     "ptm_avg": row.get("ptm_avg"),
+                    "plddt_trim_cutoff": plddt_trim_cutoff,
+                    **trim_info,
                     "status": "written",
                 })
             else:
@@ -577,6 +653,9 @@ if required_homo:
                 "chain_pair_iptm_expected": None, "chain_pair_iptm_corrected": None,
                 "chain_pair_pae_min": None, "chain_pair_pae_min_recap": None,
                 "ptm_avg": None,
+                "plddt_trim_cutoff": plddt_trim_cutoff,
+                "trim_nterm_chain1": None, "trim_cterm_chain1": None,
+                "trim_nterm_chain2": None, "trim_cterm_chain2": None,
                 "status": "missing",
             })
         elif n_written < top_n_models:
@@ -617,7 +696,8 @@ if required_hetero:
             fc_key2 = f"{row['input_name']}_{row['sample']}_{row['chain_id2']}"
             n_written += 1
             path_pdb = pdbs_dir / f"AFM_{orig1}_{orig2}_unrelaxed_rank_{n_written}_model_{n_written}.pdb"
-            if save_pair_pdb(fc_key1, fc_key2, path_pdb):
+            trim_info = save_pair_pdb(fc_key1, fc_key2, path_pdb)
+            if trim_info is not None:
                 print(f" written ({n_written}/{top_n_models}): {path_pdb} (type={source}, "
                       f"sample={row['sample']}, {metric}={row[SORT_COL]:.3f}, "
                       f"ranking_score={row['ranking_score']:.3f})")
@@ -637,6 +717,8 @@ if required_hetero:
                     "chain_pair_pae_min": row["chain_pair_pae_min"],
                     "chain_pair_pae_min_recap": row["chain_pair_pae_min_recap"],
                     "ptm_avg": row.get("ptm_avg"),
+                    "plddt_trim_cutoff": plddt_trim_cutoff,
+                    **trim_info,
                     "status": "written",
                 })
             else:
@@ -662,6 +744,9 @@ if required_hetero:
                 "chain_pair_iptm_expected": None, "chain_pair_iptm_corrected": None,
                 "chain_pair_pae_min": None, "chain_pair_pae_min_recap": None,
                 "ptm_avg": None,
+                "plddt_trim_cutoff": plddt_trim_cutoff,
+                "trim_nterm_chain1": None, "trim_cterm_chain1": None,
+                "trim_nterm_chain2": None, "trim_cterm_chain2": None,
                 "status": "missing",
             })
         elif n_written < top_n_models:
@@ -691,6 +776,8 @@ pairs_csv_cols = [
     "ranking_score", "chain_pair_iptm",
     "chain_pair_iptm_expected", "chain_pair_iptm_corrected",
     "chain_pair_pae_min", "chain_pair_pae_min_recap", "ptm_avg",
+    "plddt_trim_cutoff",
+    "trim_nterm_chain1", "trim_cterm_chain1", "trim_nterm_chain2", "trim_cterm_chain2",
     "status",
 ]
 pairs_csv_path = log_dir / f"{run_name}_pairs.csv"

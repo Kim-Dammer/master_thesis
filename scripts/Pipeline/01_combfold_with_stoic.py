@@ -80,7 +80,7 @@ from procompa.helpers import clean_identifiers
 # and a pair run against the same --out-dir/--setup-name don't overwrite each
 # other. Override at the command line with --setup-name without editing this
 # file.
-SETUP_NAME = "18_CP_model_based_on_pae"
+SETUP_NAME = "19_CP_pae_plddt_trimmed"
 
 # Raw ComplexPortal column that holds the pipe-separated molecule identifiers.
 MOLECULES_COL = "Identifiers (and stoichiometry) of molecules in complex"
