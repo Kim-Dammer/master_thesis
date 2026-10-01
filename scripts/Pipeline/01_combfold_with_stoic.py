@@ -80,7 +80,7 @@ from procompa.helpers import clean_identifiers
 # and a pair run against the same --out-dir/--setup-name don't overwrite each
 # other. Override at the command line with --setup-name without editing this
 # file.
-SETUP_NAME = "19_CP_pae_plddt_trimmed"
+SETUP_NAME = "18_CP_model_based_on_pae"
 
 # Raw ComplexPortal column that holds the pipe-separated molecule identifiers.
 MOLECULES_COL = "Identifiers (and stoichiometry) of molecules in complex"
@@ -1258,10 +1258,18 @@ def stage_submit_combfold(
           f"(source={source}); {len(skipped)} already attempted (skipped), "
           f"{len(to_submit)} to submit." + (" [force]" if force else ""))
 
+    # Trimming settings given on the 01 command line (see --plddt-trim-cutoff etc.)
+    combfold_env = getattr(paths, "combfold_env", {})
+    extra_env = "".join(f",{k}={v}" for k, v in combfold_env.items())
+    if combfold_env:
+        print(f"[submit-combfold] forwarding to s2: {combfold_env}")
+    else:
+        print("[submit-combfold] no trimming flags given; s2's own defaults apply.")
+
     spec_to_job: dict[str, int | None] = {}
     submitted_ids: list[int] = []
     for spec in to_submit:
-        cmd = ["sbatch", f"--export=ALL,METRIC={metric}", str(patched_sh), spec, source]
+        cmd = ["sbatch", f"--export=ALL,METRIC={metric}{extra_env}", str(patched_sh), spec, source]
         if dry_run:
             print(f"[DRY-RUN] {' '.join(cmd)}")
             spec_to_job[spec] = None
@@ -1394,6 +1402,13 @@ def stage_submit_post_stoic_chain(
     if paths.analyze_sh is None or not paths.analyze_sh.exists():
         sys.exit("[submit-chain] --analyze-sh path does not exist.")
     chain_sh = paths.out_dir / "_post_stoic_chain.sbatch"
+    # Re-pass the trimming flags so the chained 01 call forwards them to s2 too.
+    env_to_flag = {"PLDDT_TRIM_CUTOFF": "--plddt-trim-cutoff",
+                   "INTERFACE_KEEP_DIST": "--interface-keep-dist",
+                   "CROP_SUBUNITS": "--crop-subunits"}
+    trim_flags = "".join(
+        f"    {env_to_flag[k]} {v} \\\n" for k, v in getattr(paths, "combfold_env", {}).items()
+    )
     chain_sh.write_text(
         "#!/bin/bash\n"
         f"#SBATCH --job-name=post_stoic_chain\n"
@@ -1410,6 +1425,7 @@ def stage_submit_post_stoic_chain(
         f"    --top-n {top_n} \\\n"
         f"    --combfold-source {source} \\\n"
         f"    --metric {metric} \\\n"
+        + trim_flags +
         f"    --mode post-stoic-chain\n"
     )
     chain_sh.chmod(0o755)
@@ -1889,6 +1905,20 @@ def main() -> None:
                 default="ranking_score",
                 help="Model-selection metric, forwarded to the CombFold sbatch "
                      "as an env var (default ranking_score).")
+    # --- s2 trimming settings (forwarded to the CombFold sbatch as env vars) ---
+    # Default None = not forwarded, so the default inside s2_run_CombFold.sbatch
+    # applies. When given, the value here overrides both the s2 default and any
+    # same-named variable exported in your shell.
+    ap.add_argument("--plddt-trim-cutoff", type=float, default=None,
+                    help="s2 PLDDT_TRIM_CUTOFF: trim chain termini with CA pLDDT below "
+                         "this value (0 = no trimming). Default: s2's own default.")
+    ap.add_argument("--interface-keep-dist", type=float, default=None,
+                    help="s2 INTERFACE_KEEP_DIST (Angstrom): also stop trimming at a "
+                         "residue whose CA is within this distance of the partner "
+                         "(0 = pLDDT only). Default: s2's own default.")
+    ap.add_argument("--crop-subunits", type=int, choices=[0, 1], default=None,
+                    help="s2 CROP_SUBUNITS: 1 = crop subunits.json to the trimmed "
+                         "region, 0 = full length. Default: s2's own default.")
     ap.add_argument(
         "--mode",
         choices=[
@@ -1905,6 +1935,19 @@ def main() -> None:
 
     paths = Paths(args)
     paths.ensure_dirs()
+
+    # s2 trimming settings: only the ones given on the command line are forwarded.
+    for name in ("plddt_trim_cutoff", "interface_keep_dist"):
+        val = getattr(args, name)
+        if val is not None and val < 0:
+            sys.exit(f"--{name.replace('_', '-')} must be >= 0, got {val}")
+    paths.combfold_env = {
+        env: val for env, val in (
+            ("PLDDT_TRIM_CUTOFF", args.plddt_trim_cutoff),
+            ("INTERFACE_KEEP_DIST", args.interface_keep_dist),
+            ("CROP_SUBUNITS", args.crop_subunits),
+        ) if val is not None
+    }
 
     # --- Mode-specific required-arg checks ----------------------------------
     if args.mode in ("fasta", "all") and not args.input_tsv:

@@ -116,6 +116,21 @@ METRIC="${METRIC:-iptm}"
 PLDDT_TRIM_CUTOFF="${PLDDT_TRIM_CUTOFF:-50}"
 # 1 = also write the untrimmed pair PDBs to <run>_input/pdbs_untrimmed/
 SAVE_UNTRIMMED_PDBS="${SAVE_UNTRIMMED_PDBS:-1}"
+# INTERFACE_KEEP_DIST (Angstrom): second stop criterion for the terminal trim.
+# Trimming from an end also stops at the first residue whose CA is within
+# this distance of ANY CA of the partner chain, even if its pLDDT is
+# below PLDDT_TRIM_CUTOFF. That residue and everything inward of it is kept.
+# Distances are measured against the partner's UNTRIMMED chain, so the result
+# does not depend on which chain is trimmed first. Set to 0 to disable
+# (pure pLDDT trimming).
+INTERFACE_KEEP_DIST="${INTERFACE_KEEP_DIST:-8}"
+# CROP_SUBUNITS (1/0): when trimming is on, the sequence of each protein in
+# subunits.json is cropped to the union of the residues kept across all of that
+# protein's pair models, with start_res = first kept residue (original numbering
+# preserved). CombFold then builds the assembly from the cropped representatives,
+# so the output contains only the trimmed part of each protein.
+# 0 = subunits.json keeps the full-length sequences.
+CROP_SUBUNITS="${CROP_SUBUNITS:-1}"
 # ------------------------------------------------------------
 
 source "${VENV}/bin/activate"
@@ -158,10 +173,12 @@ echo "Source: ${SOURCE}"
 echo "Metric: ${METRIC}"
 echo "Top N models per pair: ${TOP_N_MODELS}"
 echo "pLDDT terminal trim cutoff: ${PLDDT_TRIM_CUTOFF}"
+echo "Interface keep distance: ${INTERFACE_KEEP_DIST} A"
+echo "Crop subunits to trimmed region: ${CROP_SUBUNITS}"
 
 mkdir -p logs
 
-export SPEC SOURCE METRIC TOP_N_MODELS OUTPUT_BASE SEQUENCES_PARQUET POOLED_PPI_DB PLDDT_TRIM_CUTOFF SAVE_UNTRIMMED_PDBS
+export SPEC SOURCE METRIC TOP_N_MODELS OUTPUT_BASE SEQUENCES_PARQUET POOLED_PPI_DB PLDDT_TRIM_CUTOFF SAVE_UNTRIMMED_PDBS INTERFACE_KEEP_DIST CROP_SUBUNITS
 
 # --- Recompute complex name on bash side (no temp file) -----
 COMPLEX_NAME=$(python -c "
@@ -218,6 +235,7 @@ from pathlib import Path
 import polars as pl
 import pandas as pd
 import Bio.PDB
+import Bio.SeqUtils
 import foldcomp
 import sqlite_utils
 from sqlite_utils.db import NotFoundError
@@ -233,6 +251,8 @@ pooled_ppi_db = os.environ["POOLED_PPI_DB"]
 job_id = os.environ.get("SLURM_JOB_ID", "unknown")
 plddt_trim_cutoff = float(os.environ.get("PLDDT_TRIM_CUTOFF", "0"))
 save_untrimmed = os.environ.get("SAVE_UNTRIMMED_PDBS", "1") == "1"
+interface_keep_dist = float(os.environ.get("INTERFACE_KEEP_DIST", "0"))
+crop_subunits = os.environ.get("CROP_SUBUNITS", "0") == "1"
 
 # ============================================================
 # MODEL SELECTION -- how "best" is defined for METRIC.
@@ -434,10 +454,8 @@ for protein in proteins:
     }
     print(f"Subunit {protein}: {n} copies, chains {chain_names}")
 
-subunits_path = input_dir / "subunits.json"
-with open(subunits_path, "w") as fh:
-    json.dump(js, fh, indent=2)
-print(f"Written: {subunits_path}")
+# subunits.json is written ONCE, after all pair models are fetched and trimmed
+# (see "Write subunits.json" below), because the cropped ranges are only known then.
 
 # --- Required pairwise dimers: homodimers (count>=2) + heteropairs -------
 required_homo = []
@@ -478,21 +496,29 @@ def _fetch_pdb_str(db: sqlite_utils.Database, id_: str) -> str | None:
     return pdb_str
 
 
-def trim_low_plddt_termini(chain, cutoff: float, label: str) -> tuple[int, int]:
-    """Remove residues from both termini of `chain` (in place) while their CA
-    pLDDT (stored in the B-factor column) is < cutoff. Stops at the first
-    residue from each end whose CA pLDDT >= cutoff. Residues without a CA
-    count as low-confidence. Residue numbering is left untouched.
+def trim_low_plddt_termini(chain, cutoff: float, label: str,
+                           partner_ns=None, keep_dist: float = 0.0) -> dict:
+    """Trim both termini of `chain` in place.
 
-    Returns (n_removed_N_term, n_removed_C_term). If NO residue passes the
-    cutoff, the chain is left untrimmed (so CombFold still gets the subunit)
-    and a warning is printed.
+    From each end, residues are removed until the first residue that meets
+    EITHER stop criterion:
+      (1) its CA pLDDT (B-factor) >= cutoff, or
+      (2) its CA is within keep_dist A of any CA of the partner chain
+          (partner_ns: NeighborSearch over the partner's UNTRIMMED CA atoms;
+          skipped if None or keep_dist <= 0).
+    That residue and everything inward of it is kept, including interior
+    low-pLDDT regions. Residue numbering is left untouched.
+
+    Returns a dict with n removed per end and why each end stopped
+    ("plddt", "interface", "plddt+interface", "no_trim" if cutoff<=0, or
+    "none_kept" if no residue met either criterion -> chain left untrimmed).
     """
+    info = {"n_n": 0, "n_c": 0, "stop_n": "no_trim", "stop_c": "no_trim"}
     if cutoff <= 0:
-        return 0, 0
+        return info
     residues = list(chain)
     if not residues:
-        return 0, 0
+        return info
 
     ca_b = [r["CA"].get_bfactor() for r in residues if "CA" in r]
     # Sanity check on pLDDT scale: AF3 writes 0-100. A 0-1 scale would make
@@ -502,24 +528,140 @@ def trim_low_plddt_termini(chain, cutoff: float, label: str) -> tuple[int, int]:
               f"like it is on a 0-1 scale, but cutoff={cutoff} assumes 0-100.")
         sys.exit(1)
 
-    ok = [("CA" in r) and (r["CA"].get_bfactor() >= cutoff) for r in residues]
-    if not any(ok):
-        print(f"  WARNING: {label}: no CA with pLDDT >= {cutoff}; keeping chain untrimmed.")
-        return 0, 0
+    use_iface = partner_ns is not None and keep_dist > 0
 
-    first = ok.index(True)
-    last = len(ok) - 1 - ok[::-1].index(True)
+    def stop_reason(r):
+        """'' if r should be trimmed, else which criterion keeps it."""
+        good_plddt = ("CA" in r) and (r["CA"].get_bfactor() >= cutoff)
+        near = use_iface and ("CA" in r) and bool(partner_ns.search(r["CA"].coord, keep_dist))
+        return "+".join(x for x, ok in (("plddt", good_plddt), ("interface", near)) if ok)
+
+    # Scan inward from each end; stop at the first residue that is kept.
+    first = next((i for i, r in enumerate(residues) if stop_reason(r)), None)
+    if first is None:
+        print(f"  WARNING: {label}: no residue with pLDDT >= {cutoff}"
+              f"{f' or within {keep_dist} A of partner' if use_iface else ''}; "
+              f"keeping chain untrimmed.")
+        info.update(stop_n="none_kept", stop_c="none_kept")
+        return info
+    last = next(i for i in range(len(residues) - 1, -1, -1) if stop_reason(residues[i]))
+
     for r in residues[:first] + residues[last + 1:]:
         chain.detach_child(r.id)
-    n_n, n_c = first, len(residues) - 1 - last
-    if n_n or n_c:
+    info.update(n_n=first, n_c=len(residues) - 1 - last,
+                stop_n=stop_reason(residues[first]), stop_c=stop_reason(residues[last]))
+    if info["n_n"] or info["n_c"]:
         kept = residues[first:last + 1]
-        print(f"  trimmed {label}: -{n_n} N-term, -{n_c} C-term "
+        print(f"  trimmed {label}: -{info['n_n']} N-term (stop: {info['stop_n']}), "
+              f"-{info['n_c']} C-term (stop: {info['stop_c']}) "
               f"(kept res {kept[0].id[1]}-{kept[-1].id[1]}, {len(kept)}/{len(residues)})")
-    return n_n, n_c
+    return info
 
 
-def save_pair_pdb(fc_key1: str, fc_key2: str, out_path: Path) -> dict | None:
+# --- Full-length representative subunits ------------------------------------
+# CombFold's run_on_pdbs.py needs, for EVERY subunit, at least one PDB in the
+# pdbs folder that contains the COMPLETE subunit sequence (it builds the final
+# assembly from these "representative" subunits and asserts
+# "missing rep subunits" otherwise). Trimmed pair PDBs only ever contain a
+# partial subunit, so with trimming we add one single-chain, UNTRIMMED PDB per
+# protein (REP_<protein>_full_length.pdb). A single-chain PDB has no subunit
+# pair, so it yields no transformations -- it only serves as the representative.
+# The chain used is the untrimmed chain with the highest mean CA pLDDT over all
+# pair models written, which is the same rule CombFold applies itself.
+rep_candidates: dict[str, tuple[float, str]] = {}
+# protein -> (first, last) residue number kept in ANY of its trimmed pair chains
+kept_ranges: dict[str, tuple[int, int]] = {}
+
+
+def _register_kept_range(protein: str, chain) -> None:
+    """Widen protein's kept range to include the residues left in `chain`."""
+    ids = [r.id[1] for r in chain]
+    assert ids, f"{protein}: chain {chain.id} has no residues left after trimming"
+    lo, hi = min(ids), max(ids)
+    if protein in kept_ranges:
+        lo, hi = min(lo, kept_ranges[protein][0]), max(hi, kept_ranges[protein][1])
+    kept_ranges[protein] = (lo, hi)
+
+
+def _register_rep_candidate(protein: str, chain) -> None:
+    """Remember `chain` (untrimmed) as representative for `protein` if it has
+    the highest mean CA pLDDT seen so far (ties keep the first, like CombFold)."""
+    b = [r["CA"].get_bfactor() for r in chain if "CA" in r]
+    assert b, f"{protein}: chain {chain.id} has no CA atoms"
+    mean_b = sum(b) / len(b)
+    if protein in rep_candidates and rep_candidates[protein][0] >= mean_b:
+        return
+    c = chain.copy()
+    c.id = "A"
+    s_ = Bio.PDB.Structure.Structure("rep")
+    m_ = Bio.PDB.Model.Model(0)
+    s_.add(m_)
+    m_.add(c)
+    pio = Bio.PDB.PDBIO()
+    pio.set_structure(s_)
+    buf = io.StringIO()
+    pio.save(buf)
+    rep_candidates[protein] = (mean_b, buf.getvalue())
+
+
+def _chain_seq_like_combfold(pdb_text: str) -> str:
+    """Same construction as CombFold's get_chain_to_seq(use_seqres=False):
+    residue ids 1..max, 'X' where a residue (with CA) is missing."""
+    model = Bio.PDB.PDBParser(QUIET=True).get_structure("r", io.StringIO(pdb_text))[0]
+    chain = next(model.get_chains())
+    res = {r.id[1]: r for r in chain if "CA" in r}
+    return "".join(
+        Bio.SeqUtils.seq1(res[i].get_resname()) if i in res else "X"
+        for i in range(1, max(res) + 1)
+    )
+
+
+def cropped_subunits() -> collections.OrderedDict:
+    """Return subunits dict with, per protein, the sequence cropped to the union
+    of kept residues and start_res = first kept residue number (so residue
+    numbers in the assembled output equal the original full-length numbering).
+    `js` itself is not modified (it keeps the full-length sequences)."""
+    trimmed = collections.OrderedDict()
+    for protein in proteins:
+        assert protein in kept_ranges, f"no kept range recorded for {protein}"
+        lo, hi = kept_ranges[protein]
+        full_seq = js[protein]["sequence"]
+        assert 1 <= lo <= hi <= len(full_seq), (
+            f"{protein}: kept range {lo}-{hi} outside sequence length {len(full_seq)}"
+        )
+        rep_seq = _chain_seq_like_combfold(rep_candidates[protein][1])
+        assert rep_seq[lo - 1:hi] == full_seq[lo - 1:hi], (
+            f"{protein}: residues {lo}-{hi} of the structure do not match subunits.json "
+            f"(numbering/sequence disagree), refusing to crop"
+        )
+        entry = dict(js[protein])
+        entry["start_res"] = lo
+        entry["sequence"] = full_seq[lo - 1:hi]
+        trimmed[protein] = entry
+        print(f"Cropped subunit {protein}: residues {lo}-{hi} of {len(full_seq)} "
+              f"({len(full_seq) - (hi - lo + 1)} removed)")
+    return trimmed
+
+
+def write_rep_subunits() -> None:
+    """Write REP_<protein>_full_length.pdb for every protein of the complex."""
+    for protein in proteins:
+        assert protein in rep_candidates, (
+            f"no untrimmed chain was recorded for {protein}; cannot write its "
+            f"full-length representative (was a pair model missing?)"
+        )
+        mean_b, pdb_text = rep_candidates[protein]
+        chain_seq = _chain_seq_like_combfold(pdb_text)
+        assert js[protein]["sequence"] in chain_seq, (
+            f"{protein}: representative chain sequence does not contain the "
+            f"subunits.json sequence -- CombFold would not recognise it as a complete subunit"
+        )
+        out = pdbs_dir / f"REP_{protein}_full_length.pdb"
+        out.write_text(pdb_text)
+        print(f"Representative (untrimmed) subunit {protein}: mean pLDDT {mean_b:.1f} -> {out}")
+
+
+def save_pair_pdb(fc_key1: str, fc_key2: str, out_path: Path, proteins: tuple[str, str]) -> dict | None:
     """Fetch both chains, merge them into one 2-chain structure (unchanged
     coordinates), optionally save an untrimmed copy, then trim low-pLDDT
     termini of each chain independently and write the PDB CombFold reads.
@@ -541,6 +683,13 @@ def save_pair_pdb(fc_key1: str, fc_key2: str, out_path: Path) -> dict | None:
             chain0.id = chain_id
             struct0[0].add(chain0)
 
+    chains = list(struct0[0])
+    assert len(chains) == 2, f"expected 2 chains in merged pair, got {len(chains)}"
+    if plddt_trim_cutoff > 0:
+        # Register BEFORE trimming: the representative must be full length.
+        for protein, chain in zip(proteins, chains):
+            _register_rep_candidate(protein, chain)
+
     pdbio = Bio.PDB.PDBIO()
     if save_untrimmed and plddt_trim_cutoff > 0:
         # MUST be outside pdbs/ -- CombFold reads every PDB in that folder.
@@ -549,11 +698,27 @@ def save_pair_pdb(fc_key1: str, fc_key2: str, out_path: Path) -> dict | None:
         pdbio.set_structure(struct0)
         pdbio.save(str(untrimmed_dir / out_path.name))
 
+    # Build CA neighbour searches on BOTH chains BEFORE any trimming, so each
+    # chain's interface check sees its partner's full, untrimmed CAs.
+    if plddt_trim_cutoff > 0 and interface_keep_dist > 0:
+        searches = [Bio.PDB.NeighborSearch([r["CA"] for r in c if "CA" in r]) for c in chains]
+    else:
+        searches = [None, None]
+
     trim_info = {}
-    for index, (chain, id_) in enumerate(zip(list(struct0[0]), [fc_key1, fc_key2])):
-        n_n, n_c = trim_low_plddt_termini(chain, plddt_trim_cutoff, id_)
-        trim_info[f"trim_nterm_chain{index + 1}"] = n_n
-        trim_info[f"trim_cterm_chain{index + 1}"] = n_c
+    for index, (chain, id_) in enumerate(zip(chains, [fc_key1, fc_key2])):
+        t = trim_low_plddt_termini(chain, plddt_trim_cutoff, id_,
+                                   partner_ns=searches[1 - index],
+                                   keep_dist=interface_keep_dist)
+        k = index + 1
+        trim_info[f"trim_nterm_chain{k}"] = t["n_n"]
+        trim_info[f"trim_cterm_chain{k}"] = t["n_c"]
+        trim_info[f"trim_nstop_chain{k}"] = t["stop_n"]
+        trim_info[f"trim_cstop_chain{k}"] = t["stop_c"]
+
+    if plddt_trim_cutoff > 0:
+        for protein, chain in zip(proteins, chains):
+            _register_kept_range(protein, chain)
 
     pdbio.set_structure(struct0)
     pdbio.save(str(out_path))
@@ -604,7 +769,7 @@ if required_homo:
             fc_key2 = f"{row['input_name']}_{row['sample']}_{row['chain_id2']}"
             n_written += 1
             path_pdb = pdbs_dir / f"AFM_{orig1}_{orig2}_unrelaxed_rank_{n_written}_model_{n_written}.pdb"
-            trim_info = save_pair_pdb(fc_key1, fc_key2, path_pdb)
+            trim_info = save_pair_pdb(fc_key1, fc_key2, path_pdb, proteins=(orig1, orig2))
             if trim_info is not None:
                 seen_rows.add(row_key)
                 print(f" written ({n_written}/{top_n_models}): {path_pdb} (type={source}, "
@@ -627,6 +792,7 @@ if required_homo:
                     "chain_pair_pae_min_recap": row["chain_pair_pae_min_recap"],
                     "ptm_avg": row.get("ptm_avg"),
                     "plddt_trim_cutoff": plddt_trim_cutoff,
+                    "interface_keep_dist": interface_keep_dist,
                     **trim_info,
                     "status": "written",
                 })
@@ -654,8 +820,11 @@ if required_homo:
                 "chain_pair_pae_min": None, "chain_pair_pae_min_recap": None,
                 "ptm_avg": None,
                 "plddt_trim_cutoff": plddt_trim_cutoff,
+                "interface_keep_dist": interface_keep_dist,
                 "trim_nterm_chain1": None, "trim_cterm_chain1": None,
                 "trim_nterm_chain2": None, "trim_cterm_chain2": None,
+                "trim_nstop_chain1": None, "trim_cstop_chain1": None,
+                "trim_nstop_chain2": None, "trim_cstop_chain2": None,
                 "status": "missing",
             })
         elif n_written < top_n_models:
@@ -696,7 +865,7 @@ if required_hetero:
             fc_key2 = f"{row['input_name']}_{row['sample']}_{row['chain_id2']}"
             n_written += 1
             path_pdb = pdbs_dir / f"AFM_{orig1}_{orig2}_unrelaxed_rank_{n_written}_model_{n_written}.pdb"
-            trim_info = save_pair_pdb(fc_key1, fc_key2, path_pdb)
+            trim_info = save_pair_pdb(fc_key1, fc_key2, path_pdb, proteins=(orig1, orig2))
             if trim_info is not None:
                 print(f" written ({n_written}/{top_n_models}): {path_pdb} (type={source}, "
                       f"sample={row['sample']}, {metric}={row[SORT_COL]:.3f}, "
@@ -718,6 +887,7 @@ if required_hetero:
                     "chain_pair_pae_min_recap": row["chain_pair_pae_min_recap"],
                     "ptm_avg": row.get("ptm_avg"),
                     "plddt_trim_cutoff": plddt_trim_cutoff,
+                    "interface_keep_dist": interface_keep_dist,
                     **trim_info,
                     "status": "written",
                 })
@@ -745,8 +915,11 @@ if required_hetero:
                 "chain_pair_pae_min": None, "chain_pair_pae_min_recap": None,
                 "ptm_avg": None,
                 "plddt_trim_cutoff": plddt_trim_cutoff,
+                "interface_keep_dist": interface_keep_dist,
                 "trim_nterm_chain1": None, "trim_cterm_chain1": None,
                 "trim_nterm_chain2": None, "trim_cterm_chain2": None,
+                "trim_nstop_chain1": None, "trim_cstop_chain1": None,
+                "trim_nstop_chain2": None, "trim_cstop_chain2": None,
                 "status": "missing",
             })
         elif n_written < top_n_models:
@@ -757,6 +930,22 @@ if required_hetero:
         missing_any = True
         print("Cannot run CombFold without these. "
               "Generate them with AF-Multimer / AF3 / Boltz first.")
+
+# --- Full-length representatives (only needed when trimming) ---------------
+if plddt_trim_cutoff > 0 and not missing_any:
+    write_rep_subunits()
+
+# --- Write subunits.json (once, after all pair models are fetched) ----------
+# Cropped when trimming + CROP_SUBUNITS are on; full-length otherwise. If a
+# pair is missing, the job exits below and CombFold is not run anyway.
+if plddt_trim_cutoff > 0 and crop_subunits and not missing_any:
+    subunits_out = cropped_subunits()
+else:
+    subunits_out = js
+subunits_path = input_dir / "subunits.json"
+with open(subunits_path, "w") as fh:
+    json.dump(subunits_out, fh, indent=2)
+print(f"Written: {subunits_path}")
 
 # --- Per-job source log ----------------------------------------------------
 log_dir = Path(output_base) / "pdb_source_logs"
@@ -776,8 +965,9 @@ pairs_csv_cols = [
     "ranking_score", "chain_pair_iptm",
     "chain_pair_iptm_expected", "chain_pair_iptm_corrected",
     "chain_pair_pae_min", "chain_pair_pae_min_recap", "ptm_avg",
-    "plddt_trim_cutoff",
+    "plddt_trim_cutoff", "interface_keep_dist",
     "trim_nterm_chain1", "trim_cterm_chain1", "trim_nterm_chain2", "trim_cterm_chain2",
+    "trim_nstop_chain1", "trim_cstop_chain1", "trim_nstop_chain2", "trim_cstop_chain2",
     "status",
 ]
 pairs_csv_path = log_dir / f"{run_name}_pairs.csv"
