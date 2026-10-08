@@ -48,13 +48,22 @@ Outputs (csv) written to --out-dir:
   - all_candidate_matches.csv     every (complex, pdb) pair that matched >=1 protein
   - pdb_protein_counts.parquet    cached per-pdb distinct-protein counts
 
-Usage:
+Usage Complex Portal:
   uv run 4_match_complexes_to_pdb.py \
       --complexes /cluster/project/beltrao/kdammer/master_thesis/data/Complex_Portal/Sc_ComplexTab_cleaned.csv \ 
       --mmseq /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_identity_similarity_max_sensitivity.parquet\
       --pdb-seqres /cluster/project/beltrao/kdammer/master_thesis/data/pdb/pdb_seqres.txt \
       --threshold 30 \
       --out-dir /cluster/project/beltrao/kdammer/master_thesis/data/complete_complex_pdb_mapping_v2/homology_pdb_mapping/
+
+
+Usage YeastMap:
+  uv run 4_match_complexes_to_pdb.py \
+      --complexes /cluster/project/beltrao/kdammer/master_thesis/data/Complex_Portal/YeastMap/YM_complexes_cleaned.csv \
+      --mmseq /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/YM_CP_combined/results/YM_CP_combined_mmseqs_max_sensitivity.parquet\
+      --pdb-seqres /cluster/project/beltrao/kdammer/master_thesis/data/pdb/pdb_seqres.txt \
+      --threshold 30 \
+      --out-dir /cluster/project/beltrao/kdammer/master_thesis/data/YM_CP_complete_complex_pdb_mapping/homology_pdb_mapping/
 """
 import argparse
 from pathlib import Path

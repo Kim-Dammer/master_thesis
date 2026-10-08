@@ -22,6 +22,12 @@ set -euo pipefail
 # --- USER CONFIGURATION ---
 # Combined query FASTA, already built by build_query_fasta_from_json.py, e.g.:
 #   python build_query_fasta_from_json.py --input_dir .../data --output all_queries.fasta
+
+#for CP:
+#QUERY_FASTA="/cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/all_CP_proteins_sequences.fasta"
+#WORK_DIR="/cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity"
+
+#for YM
 QUERY_FASTA="/cluster/project/beltrao/kdammer/master_thesis/data/iPTM_and_pLDDT/all_CF_YM_yeast_proteins.fasta"
 
 # Where to write mmseqs2 databases and results
@@ -32,7 +38,7 @@ PDB_SEQRES_PATH="/cluster/project/beltrao/kdammer/master_thesis/data/pdb/pdb_seq
 VENV_ACTIVATE="/cluster/project/beltrao/kdammer/master_thesis/.venv/bin/activate"
 
 THREADS=8
-SENSITIVITY=8.5   # 1 (fast/low-sensitivity) to 7.5 (max sensitivity, matches jackhmmer-ish recall)
+SENSITIVITY=8.5   # 1 (fast/low-sensitivity) to 8.5 (max sensitivity, matches jackhmmer-ish recall)
 
 # --- SCRIPT LOGIC ---
 

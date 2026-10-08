@@ -2,12 +2,17 @@
 Adding match class for best pdb match for each complex - script version of
 07_preparing_Complex_to_pdb_mapping section "Find best partial / superset complexes"
 
-Example:
+or complex portal:
 uv run 5_add_match_class_to_best_pdb.py \
-        --mmeseq_homogy_results /cluster/project/beltrao/kdammer/master_thesis/data/complete_complex_pdb_mapping_v2/homology_pdb_mapping \
+        --mmeseq_homogy_results /cluster/project/beltrao/kdammer/master_thesis/data/YM_CP_complete_complex_pdb_mapping/homology_pdb_mapping \
         --complex_portal_tsv /cluster/project/beltrao/kdammer/master_thesis/data/Complex_Portal/Saccharomyces_cerevisiae_ComplexTab.tsv \
         --exact_pdb_match_csv /cluster/project/beltrao/kdammer/master_thesis/data/complete_complex_pdb_mapping_v2/exact_pdb_match/best_coverage_complex/best_coverage_download_log.csv \
-        --output /cluster/project/beltrao/kdammer/master_thesis/data/complete_complex_pdb_mapping_v2/all_pdb_matches.csv
+        --output /cluster/project/beltrao/kdammer/master_thesis/data/YM_CP_complete_complex_pdb_mapping/all_YM_pdb_matches.csv
+
+For YM:
+uv run 5_add_match_class_to_best_pdb.py \
+        --mmeseq_homogy_results /cluster/project/beltrao/kdammer/master_thesis/data/YM_CP_complete_complex_pdb_mapping/homology_pdb_mapping \
+        --output /cluster/project/beltrao/kdammer/master_thesis/data/YM_CP_complete_complex_pdb_mapping/all_YM_pdb_matches.csv
 """
 
 import argparse
@@ -33,15 +38,14 @@ def parse_args():
     parser.add_argument(
         "--complex_portal_tsv",
         type=Path,
-        default=DEFAULT_DATA_DIR / "Complex_Portal" / "Saccharomyces_cerevisiae_ComplexTab.tsv",
-        help="Path to the Complex Portal tsv file",
+        default=None,
+        help="Path to the Complex Portal tsv file, Only needed together with --exact_pdb_match_csv",
     )
     parser.add_argument(
         "--exact_pdb_match_csv",
         type=Path,
-        default=DEFAULT_DATA_DIR / "complete_complex_pdb_mapping_v2" / "exact_pdb_match"
-                / "best_coverage_complex" / "best_coverage_download_log.csv",
-        help="Path to the exact pdb match download log csv",
+        default=None,
+        help="Path to the exact pdb match download log csv, only applies to Complex portal complexes",
     )
     parser.add_argument(
         "--output",
@@ -153,22 +157,25 @@ def keep_only_exact_match_if_present(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def build_all_pdb_matches(
-    mmeseq_homogy_results: Path, complex_portal_tsv: Path, exact_pdb_match_csv: Path
+    mmeseq_homogy_results: Path, complex_portal_tsv: Path | None, exact_pdb_match_csv: Path | None
 ) -> pl.DataFrame:
-    pdb_match_dataframes = [
-        get_exact_pdb_match(complex_portal_tsv, exact_pdb_match_csv),
+    assert (complex_portal_tsv is None) == (exact_pdb_match_csv is None), (
+        "pass both --complex_portal_tsv and --exact_pdb_match_csv, or neither"
+    )
+
+    pdb_match_tables = [
         get_exact_homology_matches(mmeseq_homogy_results),
         get_no_homology_match(mmeseq_homogy_results),
         classify_best_match_per_complex(mmeseq_homogy_results),
     ]
+    if exact_pdb_match_csv is not None:
+        pdb_match_tables.insert(0, get_exact_pdb_match(complex_portal_tsv, exact_pdb_match_csv))
 
-    pdb_match_dataframes = [
-        pdb_matches.with_columns(pl.col("n_proteins").cast(pl.Int64)) for pdb_matches in pdb_match_dataframes
+    pdb_match_tables = [
+        pdb_matches.with_columns(pl.col("n_proteins").cast(pl.Int64)) for pdb_matches in pdb_match_tables
     ]
 
-    all_pdb_matches = pl.concat(pdb_match_dataframes)
-
-    return keep_only_exact_match_if_present(all_pdb_matches)
+    return keep_only_exact_match_if_present(pl.concat(pdb_match_tables))
 
 
 def main():

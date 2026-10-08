@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
 """
-Generate self-contained HTML viewer for CP complexes with no PDB structure coverage.
+Generate a self-contained HTML viewer for CP complexes (trimmed CombFold run).
 
-For each complex (CF confidence > 80, no/partial homology PDB match):
+Per complex:
   - Left panel : CombFold assembled model; hover shows UniProt ID per chain
-  - Right panel: PDB reference structures (greedy set-cover); hover shows SIFTS
-                 UniProt + whether chain is in the CP complex
+  - Right panel: PDB reference structures (precomputed set cover) or the
+                 pairwise AF input models CombFold was given
 
-Color modes:  Single (yellow) | By chain | By mapping
-  "By mapping": CF chains colored by CP protein; PDB chains colored if their
-  SIFTS UniProt is in the complex (same palette), gray if not.
+CombFold model selection (deterministic, no name/score guessing):
+  The specs actually submitted to CombFold for a complex (true stoichiometry +
+  Stoic predictions) are read from the pipeline's expanded CSV. Each spec maps
+  to exactly one output folder, named the same way s2 names it. From those
+  runs the model with the highest score in confidence.txt is shown
+  (STOICHIOMETRY_CHOICE = "best"), or only the true-spec run is used ("true").
 
-Clicking a protein name in the "Mapped/Novel/No hit" summary lines opens a
-popup with the raw SIFTS + MMseq evidence rows for that protein against the
-currently selected reference PDB.
-
-Output: data/CP_complexes_no_struct_coverage/structure_viewer.html
+Strictness:
+  - Chain -> UniProt comes only from CombFold's chain.list (asserted complete).
+  - A model that lacks chains of its spec (partial assembly) is shown, but the
+    missing copies are listed in a red warning in the top bar.
+  - Every input folder file must be either an AFM_ pair model or a REP_
+    full-length representative (asserted).
+  - Caps (MAX_PDB_REFS, MAX_INPUT_PAIRS) are always shown in the UI when hit.
 """
-import base64, gzip, json, re, sys
+import base64
+import gzip
+import hashlib
+import json
+import re
+import sys
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -27,588 +38,529 @@ from procompa import get_project_root
 
 PRJ_ROOT = get_project_root()
 DATA     = PRJ_ROOT / "data"
-CF_BASE  = DATA / "Pipeline/10_all_CP_complexes/CombFold"
-OUT      = DATA / "Pipeline/viewer/02_structure_viewer_visualize_plddt_80.html"
-MMSEQ    = DATA / "CP_complexes_no_struct_coverage/sanity_checks/mmseq_no_Strcut_filtered.parquet"
-ANNOT    = DATA / "CP_complexes_no_struct_coverage/complex_pdb_annotations_map.csv"
 
-MAX_PDB_REFS    = 20   # safeguard cap on reference PDBs shown per complex
-MAX_INPUT_PAIRS = 15   # safeguard cap on embedded pairwise AF models per complex
-MMSEQ_RAW = PRJ_ROOT / "scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_new_identity_similarity_max_sensitivity.parquet"
-SET_COVER_PARQUET = DATA / "CP_complexes_no_struct_coverage/minimal_complex_pdb_set_cover_max_identity.parquet"  #greddy pdb approach, but with max identity sort
+# ── CombFold run to visualize ─────────────────────────────────────────────────
+SETUP_NAME   = "19_CP_pae_plddt_trimmed"
+RUN_DIR      = DATA / "Pipeline" / SETUP_NAME
+CF_BASE      = RUN_DIR / "CombFold"
+EXPANDED_CSV = RUN_DIR / f"{SETUP_NAME}_expanded.csv"
+CF_SOURCE    = "pool"     # must match --combfold-source of the run
+STOICHIOMETRY_CHOICE = "best"   # "best": top score among true + all pred runs | "true": true spec run only
+OUT          = DATA / "Pipeline/viewer/02_structure_viewer_visualize_plddt_trimmed.html"
+
+# ── annotation / reference inputs ─────────────────────────────────────────────
+INFO_CSV          = DATA / "CP_complexes_no_struct_coverage/confident_CF_complexes_with_pdb_match_info.csv"
+PDB_HITS_PARQUET  = DATA / "CP_complexes_no_struct_coverage/complex_pdb_hits.parquet"
+SET_COVER_PARQUET = DATA / "CP_complexes_no_struct_coverage/minimal_complex_pdb_set_cover_max_identity.parquet"
+ANNOT_CSV         = DATA / "CP_complexes_no_struct_coverage/complex_pdb_annotations_map.csv"
+SIFTS_CSV         = DATA / "pdb" / "pdb_chain_uniprot.csv"
+MMSEQ_FILTERED    = DATA / "CP_complexes_no_struct_coverage/sanity_checks/mmseq_no_Strcut_filtered.parquet"
+MMSEQ_RAW         = PRJ_ROOT / "scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_new_identity_similarity_max_sensitivity.parquet"
+
+EXCLUDED_COMPLEXES = {"CPX-1602"}
+MAX_PDB_REFS    = 20   # cap on reference PDBs per complex (shown in UI when hit)
+MAX_INPUT_PAIRS = 10   # cap on embedded pair models per complex (rank-1 models first; shown in UI when hit)
+N_THREADS       = 16
+GZIP_LEVEL      = 6    # level 9 is several times slower for ~1% smaller output
+
+assert STOICHIOMETRY_CHOICE in ("best", "true"), STOICHIOMETRY_CHOICE
+assert CF_SOURCE in ("pool", "pair"), CF_SOURCE
+for required_path in (CF_BASE, EXPANDED_CSV, INFO_CSV, PDB_HITS_PARQUET, SET_COVER_PARQUET,
+                      ANNOT_CSV, SIFTS_CSV, MMSEQ_FILTERED, MMSEQ_RAW):
+    assert required_path.exists(), f"required input not found: {required_path}"
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+_SPEC_TOKEN_RE  = re.compile(r"^([A-Za-z0-9_]+)\((\d+)\)$")
+_CHAIN_LIST_RE  = re.compile(r"^([A-Za-z0-9]+)_([A-Za-z0-9]+)\.pdb$")
+_AFM_FILE_RE    = re.compile(r"^AFM_([A-Z][A-Z0-9]{5,})_([A-Z][A-Z0-9]{5,})_unrelaxed_rank_(\d+)_model_\d+\.pdb$")
+_REP_FILE_RE    = re.compile(r"^REP_[A-Za-z0-9]+_full_length\.pdb$")
+_PDB_KEEP_RECORDS = frozenset({"ATOM", "HETATM", "MODEL", "ENDMDL", "TER", "END"})
+
+
 def uniprot_proteins(identifiers: str) -> set[str]:
-    out = set()
+    """UniProt accessions from the Complex Portal identifier string."""
+    proteins = set()
     for part in identifiers.split("|"):
         part = part.strip()
         if part.startswith(("CHEBI", "URS")):
             continue
-        m = re.match(r"^([A-Z][A-Z0-9]{5,})", part)
-        if m:
-            out.add(m.group(1))
-    return out
+        accession_match = re.match(r"^([A-Z][A-Z0-9]{5,})", part)
+        if accession_match:
+            proteins.add(accession_match.group(1))
+    return proteins
 
 
-def folder_proteins(name: str) -> set[str]:
-    base = name.replace("_pool_output", "").replace("_pool_input", "")
-    return set(re.findall(r"([A-Z][A-Z0-9]{5,})x\d+", base))
+def parse_spec(spec: str) -> dict[str, int]:
+    """'P1(1),P2(2)' -> {'P1': 1, 'P2': 2}; any unparseable token is an error."""
+    protein_counts: dict[str, int] = {}
+    for token in [t.strip() for t in spec.split(",") if t.strip()]:
+        token_match = _SPEC_TOKEN_RE.match(token)
+        assert token_match, f"unparseable spec token {token!r} in {spec!r}"
+        assert token_match.group(1) not in protein_counts, f"protein listed twice in spec {spec!r}"
+        protein_counts[token_match.group(1)] = int(token_match.group(2))
+    assert protein_counts, f"empty spec: {spec!r}"
+    return protein_counts
 
 
-def folder_stoic_label(name: str) -> str:
-    base  = name.replace("_pool_output", "")
-    parts = re.findall(r"([A-Z][A-Z0-9]{5,})x(\d+)", base)
-    return "  |  ".join(f"{p}x{n}" for p, n in parts)
+def output_folder_name(protein_counts: dict[str, int]) -> str:
+    """Exactly how s2 names the output folder (incl. hash for names > 200 chars)."""
+    complex_name = "_".join(f"{p}x{protein_counts[p]}" for p in sorted(protein_counts))
+    if len(complex_name) > 200:
+        complex_name = complex_name[:180] + "_" + hashlib.sha1(complex_name.encode()).hexdigest()[:12]
+    return f"{complex_name}_{CF_SOURCE}_output"
 
 
-def parse_confidence(conf_path: Path) -> list[dict]:
-    models = []
-    try:
-        for line in conf_path.read_text().splitlines():
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                try:
-                    models.append({"path": Path(parts[0]), "score": float(parts[1])})
-                except ValueError:
-                    pass
-    except Exception as e:
-        print(f"  WARNING {conf_path}: {e}", file=sys.stderr)
-    return sorted(models, key=lambda x: x["score"], reverse=True)
+def stoic_label(protein_counts: dict[str, int]) -> str:
+    return "  |  ".join(f"{p}x{protein_counts[p]}" for p in sorted(protein_counts))
+
+
+def parse_confidence(confidence_path: Path) -> list[dict]:
+    """All '<model_path> <score>' lines, best first. Any malformed line is an error."""
+    scored_models = []
+    for line in confidence_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        assert len(fields) == 2, f"malformed line in {confidence_path}: {line!r}"
+        scored_models.append({"path": Path(fields[0]), "score": float(fields[1])})
+    return sorted(scored_models, key=lambda model: model["score"], reverse=True)
 
 
 def compress(text: str) -> str:
-    return base64.b64encode(gzip.compress(text.encode())).decode()
+    return base64.b64encode(gzip.compress(text.encode(), compresslevel=GZIP_LEVEL)).decode()
 
 
 def strip_pdb(text: str) -> str:
-    """Keep only coordinate records, discarding REMARK/HEADER/SEQRES etc.
-
-    AlphaFold2 unrelaxed PDBs embed the full PAE matrix in REMARK 3, which
-    can be 3–10 MB for large proteins. Stripping to ATOM/HETATM/TER/END
-    reduces each pairwise input file to a few hundred KB before gzip, which
-    then compresses to ~50 KB -- essential for keeping the HTML file small."""
-    _KEEP = frozenset({"ATOM", "HETATM", "MODEL", "ENDMDL", "TER", "END"})
-    return "\n".join(
-        line for line in text.splitlines()
-        if line[:6].strip() in _KEEP
-    )
+    """Keep only coordinate records (drops REMARK blocks, e.g. embedded PAE)."""
+    return "\n".join(line for line in text.splitlines() if line[:6].strip() in _PDB_KEEP_RECORDS)
 
 
-
-def read_chain_list(folder_name: str) -> dict[str, str] | None:
-    """Ground-truth chain -> UniProt map from CombFold's own output manifest.
-    Format: one 'UNIPROT_CHAIN.pdb' line per chain, e.g. 'P41735_E.pdb'.
-    Returns None if the file is missing (caller falls back to the
-    positional folder-name-parsing heuristic)."""
-    path = CF_BASE / folder_name / "_unified_representation" / "assembly_output" / "chain.list"
-    if not path.exists():
-        return None
-    mapping: dict[str, str] = {}
-    try:
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            m = re.match(r"^([A-Za-z0-9]+)_([A-Za-z0-9]+)\.pdb$", line)
-            if not m:
-                print(f"  WARNING unparseable chain.list line in {folder_name}: {line!r}",
-                      file=sys.stderr)
-                continue
-            uniprot, chain = m.group(1), m.group(2)
-            mapping[chain] = uniprot
-    except Exception as e:
-        print(f"  WARNING failed to read chain.list for {folder_name}: {e}", file=sys.stderr)
-        return None
-    return mapping or None
-
-
-def build_cf_chain_map(pdb_text: str, folder_name: str) -> dict[str, str]:
-    """Map CombFold output chain letter -> UniProt accession.
-
-    Primary source: CombFold's own chain.list manifest
-    (_unified_representation/assembly_output/chain.list), which states the
-    UNIPROT_CHAIN assignment directly -- no positional guessing.
-
-    Fallback (only when chain.list is missing): the previous positional
-    heuristic, which zips PDB-file chain-appearance-order against
-    folder-name-parse-order. This has no independent ground truth and is
-    known to break for large complexes with truncated folder names -- kept
-    only so older/incomplete CombFold runs still get a best-effort mapping,
-    with a warning so affected complexes are identifiable in the build log.
-    """
-    manifest = read_chain_list(folder_name)
-
-    chains_in_model: list[str] = []
+def pdb_chain_order(pdb_text: str) -> list[str]:
+    """Chain IDs of ATOM records in order of first appearance."""
+    chain_ids: list[str] = []
+    seen_chain_ids: set[str] = set()
     for line in pdb_text.splitlines():
-        if line.startswith("ATOM") and len(line) > 21:
-            ch = line[21]
-            if ch not in chains_in_model:
-                chains_in_model.append(ch)
-
-    if manifest is not None:
-        missing = [ch for ch in chains_in_model if ch not in manifest]
-        if missing:
-            print(f"  WARNING chain.list for {folder_name} has no entry for "
-                  f"model chains {missing} -- these will render as 'unknown'",
-                  file=sys.stderr)
-        return manifest
-
-    print(f"  WARNING no chain.list found for {folder_name} -- "
-          f"falling back to positional folder-name matching (less reliable)",
-          file=sys.stderr)
-    base = folder_name.replace("_pool_output", "")
-    uniprot_list = [
-        acc
-        for acc, n in re.findall(r"([A-Z][A-Z0-9]{5,})x(\d+)", base)
-        for _ in range(int(n))
-    ]
-    if len(chains_in_model) != len(uniprot_list):
-        print(
-            f"  WARNING chain/uniprot count mismatch in {folder_name}: "
-            f"{len(chains_in_model)} chains {chains_in_model} vs "
-            f"{len(uniprot_list)} parsed from folder name {uniprot_list} -- "
-            f"unmapped chains will render as 'unknown', not as uncovered",
-            file=sys.stderr,
-        )
-    return {ch: uniprot_list[i] for i, ch in enumerate(chains_in_model) if i < len(uniprot_list)}
+        if line.startswith("ATOM") and len(line) > 21 and line[21] not in seen_chain_ids:
+            seen_chain_ids.add(line[21])
+            chain_ids.append(line[21])
+    return chain_ids
 
 
-def build_pdb_chain_map(pdb_id: str, sifts_lookup: dict, complex_proteins: set) -> dict:
-    """Map PDB chain letter -> {u: UniProt, cp: bool} via SIFTS."""
-    return {
-        chain: {"u": uni, "cp": uni in complex_proteins}
-        for chain, uni in sifts_lookup.get(pdb_id.lower(), {}).items()
-    }
-
-
-def build_pdb_homology_map(pdb_id: str, homology_lookup: dict, complex_proteins: set) -> dict:
-    """Map PDB chain letter -> list of CP proteins with homology hit to that chain."""
-    return {
-        chain: [p for p in prots if p in complex_proteins]
-        for chain, prots in homology_lookup.get(pdb_id.lower(), {}).items()
-    }
-
-
-def read_input_models(input_folder_name: str, max_pairs: int | None = None) -> list[dict]:
-    """Read, strip, and compress pairwise AlphaFold input PDBs.
-
-    Expects files matching AFM_PROT1_PROT2_unrelaxed_*.pdb under
-    <CF_BASE>/<input_folder_name>/pdbs/.  REMARK blocks are stripped before
-    compression so PAE data (potentially several MB per file) is not embedded.
-    Returns list of dicts: {filename, label, proteins: [p1, p2], pdb_gz}.
-
-    max_pairs: if set, stop after reading this many files (sorted alphabetically)
-    so that large complexes don't bloat the output HTML."""
-    pdbs_dir = CF_BASE / input_folder_name / "pdbs"
-    if not pdbs_dir.exists():
-        print(f"  WARNING no input pdbs/ dir at {pdbs_dir} -- "
-              f"Input Pairs tab will be empty for this complex", file=sys.stderr)
-        return []
-    all_pdb_files = sorted(pdbs_dir.glob("*.pdb"))
-    models: list[dict] = []
-    unmatched = 0
-    for pdb_file in all_pdb_files:
-        if max_pairs is not None and len(models) >= max_pairs:
-            print(f"  WARNING input pairs capped at {max_pairs} "
-                  f"(found {len(all_pdb_files)} files in {pdbs_dir})", file=sys.stderr)
-            break
-        m = re.match(r"AFM_([A-Z][A-Z0-9]{5,})_([A-Z][A-Z0-9]{5,})_", pdb_file.name)
-        if not m:
-            unmatched += 1
+def read_chain_list(output_folder: str) -> dict[str, str]:
+    """CombFold's own chain -> UniProt manifest (one 'UNIPROT_CHAIN.pdb' per line)."""
+    chain_list_path = CF_BASE / output_folder / "_unified_representation" / "assembly_output" / "chain.list"
+    assert chain_list_path.exists(), f"chain.list missing: {chain_list_path}"
+    chain_to_protein: dict[str, str] = {}
+    for line in chain_list_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
             continue
-        p1, p2   = m.group(1), m.group(2)
-        proteins = [p1, p2]
-        label    = f"{p1} – {p2}" if p1 != p2 else f"{p1} (homo)"
-        try:
-            text     = pdb_file.read_text()
-            stripped = strip_pdb(text)
-            models.append({
-                "filename": pdb_file.name,
-                "label"   : label,
-                "proteins": proteins,
-                "pdb_gz"  : compress(stripped),
-            })
-        except Exception as e:
-            print(f"  WARNING read input {pdb_file}: {e}", file=sys.stderr)
-    if unmatched:
-        print(f"  WARNING {unmatched}/{len(all_pdb_files)} files in {pdbs_dir} "
-              f"did not match the AFM_<P1>_<P2>_ naming pattern -- "
-              f"check for a different filename convention on large complexes",
-              file=sys.stderr)
-    return models
+        chain_list_match = _CHAIN_LIST_RE.match(line)
+        assert chain_list_match, f"unparseable chain.list line in {output_folder}: {line!r}"
+        protein, chain = chain_list_match.group(1), chain_list_match.group(2)
+        assert chain not in chain_to_protein, f"chain {chain} listed twice in {chain_list_path}"
+        chain_to_protein[chain] = protein
+    assert chain_to_protein, f"empty chain.list: {chain_list_path}"
+    return chain_to_protein
 
 
-def sniff_delimiter(path: Path, default: str = ",") -> str:
-    """Detect comma- vs tab-separated CSV from the first non-comment line."""
-    with open(path, encoding="utf-8", errors="ignore") as fh:
-        for line in fh:
-            if not line.strip() or line.startswith("#"):
-                continue
-            return "\t" if line.count("\t") > line.count(",") else ","
-    return default
+def build_cf_chain_map(model_text: str, output_folder: str,
+                       protein_counts: dict[str, int]) -> tuple[dict[str, str], dict[str, int]]:
+    """Return (model chain -> UniProt, {protein: missing copies}) for an assembled model."""
+    chain_to_protein = read_chain_list(output_folder)
+    model_chains = pdb_chain_order(model_text)
+    unknown_chains = [ch for ch in model_chains if ch not in chain_to_protein]
+    assert not unknown_chains, f"{output_folder}: model chains {unknown_chains} not in chain.list"
+    proteins_not_in_spec = set(chain_to_protein.values()) - set(protein_counts)
+    assert not proteins_not_in_spec, f"{output_folder}: chain.list has proteins not in spec: {proteins_not_in_spec}"
+
+    present_copies = Counter(chain_to_protein[ch] for ch in model_chains)
+    excess_copies = {p: n for p, n in present_copies.items() if n > protein_counts[p]}
+    assert not excess_copies, f"{output_folder}: more copies in model than in spec: {excess_copies}"
+    missing_copies = {p: n - present_copies[p] for p, n in protein_counts.items() if present_copies[p] < n}
+    return {ch: chain_to_protein[ch] for ch in model_chains}, missing_copies
 
 
-# ── load data ─────────────────────────────────────────────────────────────────
+def read_input_models(input_folder: str) -> tuple[list[dict], int]:
+    """Pairwise AF models CombFold was given (pdbs/ of the input folder).
 
-print("Loading CSV / parquets...")
-info_df = pl.read_csv(
-    DATA / "CP_complexes_no_struct_coverage/confident_CF_complexes_with_pdb_match_info.csv"
-)
-complexes_df = (
-    info_df
+    Ordered by (rank, protein1, protein2) so the cap keeps the rank-1 model of
+    as many pairs as possible. Returns (embedded models, total pair models)."""
+    pdbs_dir = CF_BASE / input_folder / "pdbs"
+    assert pdbs_dir.is_dir(), f"input pdbs dir missing: {pdbs_dir}"
+    pair_model_files: list[tuple[int, str, str, Path]] = []
+    for pdb_file in pdbs_dir.glob("*.pdb"):
+        afm_match = _AFM_FILE_RE.match(pdb_file.name)
+        if afm_match:
+            pair_model_files.append((int(afm_match.group(3)), afm_match.group(1), afm_match.group(2), pdb_file))
+            continue
+        assert _REP_FILE_RE.match(pdb_file.name), f"unexpected file in {pdbs_dir}: {pdb_file.name}"
+    assert pair_model_files, f"no AFM_ pair models in {pdbs_dir}"
+    pair_model_files.sort()
+
+    embedded_models = []
+    for model_rank, protein1, protein2, pdb_file in pair_model_files[:MAX_INPUT_PAIRS]:
+        stripped_text = strip_pdb(pdb_file.read_text())
+        pair_chains = pdb_chain_order(stripped_text)
+        assert len(pair_chains) == 2, f"{pdb_file}: expected 2 chains, got {pair_chains}"
+        pair_name = f"{protein1} – {protein2}" if protein1 != protein2 else f"{protein1} (homo)"
+        embedded_models.append({
+            "filename" : pdb_file.name,
+            "label"    : f"{pair_name}  #{model_rank}",
+            "proteins" : [protein1, protein2],
+            # s2 writes protein1 as the first chain, protein2 as the second
+            "chain_map": {pair_chains[0]: protein1, pair_chains[1]: protein2},
+            "pdb_gz"   : compress(stripped_text),
+        })
+    return embedded_models, len(pair_model_files)
+
+
+def sniff_delimiter(path: Path) -> str:
+    """Comma vs tab, from the first non-comment line."""
+    with open(path, encoding="utf-8", errors="ignore") as file_handle:
+        for line in file_handle:
+            if line.strip() and not line.startswith("#"):
+                return "\t" if line.count("\t") > line.count(",") else ","
+    raise AssertionError(f"no data lines in {path}")
+
+
+def assert_unique(table: pl.DataFrame, key_cols: list[str], what: str) -> None:
+    duplicated_keys = table.filter(pl.struct(key_cols).is_duplicated())
+    assert duplicated_keys.is_empty(), f"{what}: non-unique {key_cols}:\n{duplicated_keys}"
+
+
+def split_hit_id(hit_col: str = "hit_pdb_id") -> list[pl.Expr]:
+    """'1abc_A' -> hit_pdb_lower='1abc', hit_chain='A' (chain keeps any further '_')."""
+    hit_parts = pl.col(hit_col).str.splitn("_", 2)
+    return [hit_parts.struct.field("field_0").str.to_lowercase().alias("hit_pdb_lower"),
+            hit_parts.struct.field("field_1").alias("hit_chain")]
+
+
+# ── complexes ─────────────────────────────────────────────────────────────────
+
+print("Loading complexes...")
+complex_info = (
+    pl.read_csv(INFO_CSV)
     .select(["complex_ac", "identifiers", "CF_confidence_max", "match_class"])
-    .unique("complex_ac")
+    .unique()
+    .filter(~pl.col("complex_ac").is_in(list(EXCLUDED_COMPLEXES)))
     .sort("CF_confidence_max", descending=True)
 )
-complexes_df = complexes_df.filter(pl.col("complex_ac") != "CPX-1602")
-print(f"  {len(complexes_df)} complexes (CF > 80)")
-
-pdb_hits = pl.read_parquet(
-    DATA / "CP_complexes_no_struct_coverage/complex_pdb_hits.parquet"
-)
-
-print("Loading precomputed PDB set cover...")
-assert SET_COVER_PARQUET.exists(), f"Set cover parquet not found: {SET_COVER_PARQUET}"
-_sc = pl.read_parquet(SET_COVER_PARQUET)
-assert {"complex_ac", "cover_100_pdbs", "cover_75_pdbs"}.issubset(set(_sc.columns)), (
-    f"Set cover parquet missing expected columns; got {_sc.columns}"
-)
-cover_lookup: dict[str, dict[str, list[str]]] = {
-    r["complex_ac"]: {
-        "cover_100": r["cover_100_pdbs"] or [],
-        "cover_75":  r["cover_75_pdbs"]  or [],
-    }
-    for r in _sc.iter_rows(named=True)
+assert_unique(complex_info, ["complex_ac"], str(INFO_CSV))
+target_proteins_by_complex: dict[str, set[str]] = {
+    info_row["complex_ac"]: uniprot_proteins(info_row["identifiers"])
+    for info_row in complex_info.iter_rows(named=True)
 }
-print(f"  {len(cover_lookup)} complexes with precomputed cover")
+complex_acs = list(target_proteins_by_complex)
+all_target_proteins = set().union(*target_proteins_by_complex.values())
+print(f"  {len(complex_acs)} complexes")
 
-# Complex Portal annotations: complex-level name + per-PDB description.
-# Coverage is partial by design (not every reference PDB has an entry) --
-# lookups below must return None cleanly for missing pairs, not raise.
-# The browser fills the gap for missing per-PDB rows with RCSB's own
-# entry title, fetched alongside the structure at view time.
-print("Loading complex/PDB annotations...")
-assert ANNOT.exists(), f"Annotation file not found: {ANNOT}"
-annot_df = pl.read_csv(ANNOT)
-required_cols = {"complex_ac", "pdb_id", "cp_annotation", "pdb_annotation"}
-assert required_cols.issubset(set(annot_df.columns)), (
-    f"Annotation file missing columns: {required_cols - set(annot_df.columns)}"
+# ── submitted CombFold specs -> output folders ────────────────────────────────
+
+print("Loading submitted CombFold specs...")
+expanded_runs = pl.read_csv(EXPANDED_CSV, infer_schema_length=0)
+required_expanded_cols = {"#Complex ac", "combfold_submission", "stoic_pred_rank", "is_true_spec"}
+assert required_expanded_cols <= set(expanded_runs.columns), (
+    f"{EXPANDED_CSV} missing columns: {required_expanded_cols - set(expanded_runs.columns)}"
 )
-
-cp_annotation_lookup: dict[str, str] = {}
-pdb_annotation_lookup: dict[tuple[str, str], str] = {}
-for r in annot_df.iter_rows(named=True):
-    ac_  = r["complex_ac"]
-    pid_ = (r["pdb_id"] or "").lower()
-    cp_a  = r["cp_annotation"]
-    pdb_a = r["pdb_annotation"]
-    if ac_ and cp_a and ac_ not in cp_annotation_lookup:
-        cp_annotation_lookup[ac_] = cp_a
-    if ac_ and pid_ and pdb_a:
-        pdb_annotation_lookup[(ac_, pid_)] = pdb_a
-print(f"  {len(cp_annotation_lookup)} complex annotations, "
-      f"{len(pdb_annotation_lookup)} complex/PDB pair annotations")
-
-# SIFTS: PDB chain -> UniProt
-print("Loading SIFTS...")
-sifts_path = DATA / "pdb" / "pdb_chain_uniprot.csv"
-assert sifts_path.exists(), f"SIFTS file not found: {sifts_path}"
-
-sifts_sep = sniff_delimiter(sifts_path)
-print(f"  detected delimiter: {'TAB' if sifts_sep == chr(9) else 'COMMA'}")
-sifts_df = pl.read_csv(sifts_path, comment_prefix="#", infer_schema_length=0,
-                        separator=sifts_sep)
-assert "CHAIN" in sifts_df.columns and "SP_PRIMARY" in sifts_df.columns, (
-    f"SIFTS columns mismatch — expected CHAIN/SP_PRIMARY, got {sifts_df.columns}. "
-    f"Detected separator was {sifts_sep!r} -- check the file's actual format."
-)
-
-sifts_lookup: dict[str, dict[str, str]] = {}
-pdb_col = sifts_df.columns[0]
-for pdb, chain, uni in sifts_df.select([pdb_col, "CHAIN", "SP_PRIMARY"]).iter_rows():
-    if pdb and chain and uni:
-        sifts_lookup.setdefault(pdb.lower(), {}).setdefault(chain, uni)
-assert len(sifts_lookup) > 0, "SIFTS lookup is empty after parsing"
-print(f"  {len(sifts_lookup)} PDB entries loaded")
-
-# MMseq homology (pre-filtered): PDB chain -> CP protein (cross-species)
-print("Loading MMseq homology hits...")
-assert MMSEQ.exists(), f"MMseq file not found: {MMSEQ}"
-mmseq_df = pl.read_parquet(MMSEQ)
-homology_lookup: dict[str, dict[str, list[str]]] = {}
-for protein, hit in mmseq_df.select(["protein_id", "hit_pdb_id"]).iter_rows():
-    parts = hit.split("_")
-    if len(parts) >= 2:
-        pid, chain = parts[0].lower(), parts[1]
-        homology_lookup.setdefault(pid, {}).setdefault(chain, []).append(protein)
-assert len(homology_lookup) > 0, "MMseq homology lookup is empty after parsing"
-print(f"  {len(homology_lookup)} PDB entries with homology hits")
-
-# Pre-scan ALL pool_output folders once
-print("Scanning CombFold output folders...")
-all_folders: dict[str, tuple[Path, list]] = {}
-for d in CF_BASE.iterdir():
-    if not d.name.endswith("_pool_output"):
+# complex_ac -> output folder -> {"labels": [...], "protein_counts": {...}}
+# (true spec and a correct prediction share a folder -> labels merged)
+cf_runs_by_complex: dict[str, dict[str, dict]] = {}
+n_rows_without_spec = 0
+for run_row in expanded_runs.iter_rows(named=True):
+    spec = run_row["combfold_submission"]
+    if not spec:
+        n_rows_without_spec += 1
         continue
-    conf = d / "assembled_results" / "confidence.txt"
-    if not conf.exists():
-        continue
-    models = parse_confidence(conf)
-    if models:
-        all_folders[d.name] = (d / "assembled_results", models)
-print(f"  {len(all_folders)} folders with assembled results")
-
-# Index folders by protein so per-complex matching is O(candidates) instead
-# of O(all_folders). Previously folder_proteins() (a regex scan) ran once
-# per complex PER FOLDER -- for many complexes against many folders this
-# dominated runtime. Now it's computed once per folder, and per-complex
-# lookup only has to check folders that actually share a protein with the
-# complex, via an inverted index -- same result set as the full scan
-# (still verified with the `fp <= target` subset check below), just far
-# fewer candidates to check.
-print("Indexing CombFold folders by protein (for fast complex matching)...")
-folder_proteins_cache: dict[str, frozenset[str]] = {
-    fname: frozenset(folder_proteins(fname)) for fname in all_folders
-}
-protein_to_folders: dict[str, list[str]] = {}
-for fname, fp in folder_proteins_cache.items():
-    for p in fp:
-        protein_to_folders.setdefault(p, []).append(fname)
-print(f"  indexed {len(protein_to_folders)} distinct proteins across folders")
-
-
-# ── process each complex ──────────────────────────────────────────────────────
-
-EMBED: dict[str, dict] = {}
-
-def process_complex(row: dict) -> tuple[str, dict]:
-    ac          = row["complex_ac"]
-    identifiers = row["identifiers"]
-    cf_max      = float(row["CF_confidence_max"])
-    match_class = row["match_class"] or "unknown"
-    target      = uniprot_proteins(identifiers)
-
-    log = [f"\n{ac}  CF={cf_max:.1f}  {match_class}  ({len(target)} proteins)"]
-
-    best_models: list[dict] = []
-    best_label  = ""
-    best_delta  = float("inf")
-
-    def read_models(fname, models):
-        candidate = []
-        for m in models[:1]:
-            if m["path"].exists():
-                try:
-                    text = m["path"].read_text()
-                    candidate.append({
-                        "name"     : m["path"].name,
-                        "score"    : m["score"],
-                        "pdb_gz"   : compress(text),
-                        "chain_map": build_cf_chain_map(text, fname),
-                        "folder"   : fname,
-                        "path"     : str(m["path"]),
-                    })
-                except Exception as e:
-                    log.append(f"  WARNING read {m['path']}: {e}")
-        return candidate
-
-    # Pass 1: protein-set match (exact or folder subset of target).
-    # Only folders sharing at least one protein with `target` can possibly
-    # satisfy `fp <= target` (fp non-empty), so the inverted index narrows
-    # the scan to just those instead of walking every folder.
-    candidate_fnames = set()
-    for p in target:
-        candidate_fnames.update(protein_to_folders.get(p, []))
-    for fname in candidate_fnames:
-        fp = folder_proteins_cache[fname]
-        assembled, models = all_folders[fname]
-        delta = abs(models[0]["score"] - cf_max)
-        if fp and fp <= target and delta < best_delta:
-            candidate = read_models(fname, models)
-            if candidate:
-                best_delta, best_label, best_models = delta, folder_stoic_label(fname), candidate
-
-    # Pass 2: score-only fallback (large complexes with truncated folder names)
-    if not best_models:
-        log.append(f"  no protein-set match -- trying score-only fallback")
-        for fname, (assembled, models) in all_folders.items():
-            delta = abs(models[0]["score"] - cf_max)
-            if delta < best_delta:
-                candidate = read_models(fname, models)
-                if candidate:
-                    best_delta  = delta
-                    best_label  = folder_stoic_label(fname) + "  (score-match only)"
-                    best_models = candidate
-
-    if best_models:
-        log.append(f"  CF models: {len(best_models)}  delta={best_delta:.3f}  [{best_label[:60]}]")
+    pred_rank = run_row["stoic_pred_rank"]
+    if pred_rank:
+        run_label = f"pred_{int(float(pred_rank))}"
     else:
-        log.append(f"  WARNING: no CF models found")
-
-    # PDB set cover -- precomputed; IDs only, browser fetches on demand
-    _ac_cover = cover_lookup.get(ac, {})
-    cover = _ac_cover.get("cover_100") or _ac_cover.get("cover_75") or []
-
-    # pdb_proteins: still needed for the embed (maps each cover PDB -> proteins)
-    pdb_proteins: dict[str, list[str]] = {}
-    hits = pdb_hits.filter(pl.col("complex_ac") == ac)
-    for h in hits.iter_rows(named=True):
-        if h["pdb_id"] and h["proteins"]:
-            pdb_proteins[h["pdb_id"]] = list(h["proteins"])
-
-    pdb_cap_hit = len(cover) > MAX_PDB_REFS
-    if pdb_cap_hit:
-        log.append(f"  WARNING {ac}: PDB cover has {len(cover)} entries, "
-                   f"capping at {MAX_PDB_REFS}")
-    cover = cover[:MAX_PDB_REFS]
-    log.append(f"  PDB cover: {cover}")
-
-    cf_chain_map    = best_models[0].get("chain_map", {}) if best_models else {}
-    if best_models:
-        assert cf_chain_map, (
-            f"CF chain map is empty for {ac} — check folder name parsing "
-            f"(folder: {best_label})"
+        assert str(run_row["is_true_spec"]).lower() == "true", (
+            f"row without stoic_pred_rank is not the true spec: {run_row}"
         )
-    cf_models_clean = [{"name": m["name"], "score": m["score"], "pdb_gz": m["pdb_gz"],
-                        "folder": m["folder"], "path": m["path"]}
-                       for m in best_models]
+        run_label = "true"
+    protein_counts = parse_spec(spec)
+    folder_runs = cf_runs_by_complex.setdefault(run_row["#Complex ac"], {})
+    run_entry = folder_runs.setdefault(output_folder_name(protein_counts),
+                                       {"labels": [], "protein_counts": protein_counts})
+    run_entry["labels"].append(run_label)
+print(f"  {len(cf_runs_by_complex)} complexes with submitted specs "
+      f"({n_rows_without_spec} expanded rows without a spec)")
+complexes_without_runs = [ac for ac in complex_acs if ac not in cf_runs_by_complex]
+if complexes_without_runs:
+    print(f"  WARNING {len(complexes_without_runs)} complexes have no submitted spec: "
+          f"{complexes_without_runs}", file=sys.stderr)
 
-    # Input pairwise AF models: stripped of REMARK/PAE before compression.
-    # Capped defensively -- large complexes (many chains) can have a large
-    # number of required pairwise predictions, and each embedded pair adds
-    # to the output HTML's size, so an uncapped read risks bloating/slowing
-    # the page precisely for the large complexes where this was reported broken.
-    input_folder      = best_models[0]["folder"].replace("_pool_output", "_pool_input") if best_models else ""
-    input_models_list = read_input_models(input_folder, max_pairs=MAX_INPUT_PAIRS) if input_folder else []
-    if input_folder and not (CF_BASE / input_folder).exists():
-        log.append(f"  WARNING expected input folder does not exist: {CF_BASE / input_folder} "
-                   f"(derived from CF folder {best_models[0]['folder']!r} by suffix swap -- "
-                   f"if the real folder is named differently for large complexes, this is why "
-                   f"Input Pairs is empty)")
-    if input_models_list:
-        kb = sum(len(m["pdb_gz"]) for m in input_models_list) // 1024
-        log.append(f"  Input pairs: {len(input_models_list)} ({kb} KB compressed)")
+# ── PDB set cover ─────────────────────────────────────────────────────────────
+
+print("Loading PDB set cover...")
+set_cover = pl.read_parquet(SET_COVER_PARQUET)
+assert {"complex_ac", "cover_100_pdbs", "cover_75_pdbs"} <= set(set_cover.columns), set_cover.columns
+assert_unique(set_cover, ["complex_ac"], str(SET_COVER_PARQUET))
+pdb_cover_by_complex: dict[str, dict] = {}
+for cover_row in set_cover.filter(pl.col("complex_ac").is_in(complex_acs)).iter_rows(named=True):
+    if cover_row["cover_100_pdbs"]:
+        cover_level, cover_pdbs = "100", list(cover_row["cover_100_pdbs"])
+    elif cover_row["cover_75_pdbs"]:
+        cover_level, cover_pdbs = "75", list(cover_row["cover_75_pdbs"])
     else:
-        log.append(f"  Input pairs: none found")
+        cover_level, cover_pdbs = None, []
+    pdb_cover_by_complex[cover_row["complex_ac"]] = {
+        "level": cover_level, "pdb_ids": cover_pdbs[:MAX_PDB_REFS], "n_total": len(cover_pdbs),
+    }
+needed_pdbs_lower = {
+    pdb_id.lower() for cover in pdb_cover_by_complex.values() for pdb_id in cover["pdb_ids"]
+}
+print(f"  {len(pdb_cover_by_complex)} complexes with cover, {len(needed_pdbs_lower)} distinct PDBs")
+
+# ── PDB -> CP proteins (complex_pdb_hits) ─────────────────────────────────────
+
+complex_pdb_hits = (
+    pl.read_parquet(PDB_HITS_PARQUET)
+    .filter(pl.col("complex_ac").is_in(complex_acs) & pl.col("pdb_id").is_not_null())
+    .select(["complex_ac", "pdb_id", "proteins"])
+)
+assert_unique(complex_pdb_hits, ["complex_ac", "pdb_id"], str(PDB_HITS_PARQUET))
+pdb_proteins_by_complex: dict[str, dict[str, list[str]]] = {}
+for hit_row in complex_pdb_hits.iter_rows(named=True):
+    pdb_proteins_by_complex.setdefault(hit_row["complex_ac"], {})[hit_row["pdb_id"]] = list(hit_row["proteins"] or [])
+
+# ── Complex Portal annotations ────────────────────────────────────────────────
+
+print("Loading annotations...")
+annotations = pl.read_csv(ANNOT_CSV)
+assert {"complex_ac", "pdb_id", "cp_annotation", "pdb_annotation"} <= set(annotations.columns), annotations.columns
+complex_annotations = (
+    annotations.filter(pl.col("complex_ac").is_not_null() & pl.col("cp_annotation").is_not_null())
+    .select(["complex_ac", "cp_annotation"]).unique()
+)
+assert_unique(complex_annotations, ["complex_ac"], f"{ANNOT_CSV} cp_annotation")
+cp_annotation_by_complex = dict(complex_annotations.iter_rows())
+pdb_annotations = (
+    annotations
+    .filter(pl.col("complex_ac").is_not_null() & pl.col("pdb_id").is_not_null()
+            & pl.col("pdb_annotation").is_not_null())
+    .select(["complex_ac", pl.col("pdb_id").str.to_lowercase().alias("pdb_lower"), "pdb_annotation"])
+    .unique()
+)
+assert_unique(pdb_annotations, ["complex_ac", "pdb_lower"], f"{ANNOT_CSV} pdb_annotation")
+pdb_annotation_by_pair = {(ac, pdb_lower): text for ac, pdb_lower, text in pdb_annotations.iter_rows()}
+print(f"  {len(cp_annotation_by_complex)} complex annotations, {len(pdb_annotation_by_pair)} complex/PDB annotations")
+
+# ── SIFTS (restricted to needed PDBs) ─────────────────────────────────────────
+
+print("Loading SIFTS...")
+sifts_rows = pl.read_csv(SIFTS_CSV, comment_prefix="#", infer_schema_length=0,
+                         separator=sniff_delimiter(SIFTS_CSV))
+assert {"PDB", "CHAIN", "SP_PRIMARY"} <= set(sifts_rows.columns), (
+    f"SIFTS columns mismatch, got {sifts_rows.columns}"
+)
+sifts_rows = sifts_rows.filter(
+    pl.col("PDB").str.to_lowercase().is_in(list(needed_pdbs_lower))
+    & pl.col("CHAIN").is_not_null() & pl.col("SP_PRIMARY").is_not_null()
+)
+# pdb_lower -> chain -> all UniProts mapped to that chain (chimeric chains have several)
+sifts_chain_uniprots: dict[str, dict[str, list[str]]] = {}
+for pdb_id, chain, chain_uniprots in (
+    sifts_rows.group_by(["PDB", "CHAIN"]).agg(pl.col("SP_PRIMARY").unique().sort()).iter_rows()
+):
+    sifts_chain_uniprots.setdefault(pdb_id.lower(), {})[chain] = chain_uniprots
+# pdb_lower -> accession -> raw SIFTS rows (evidence popup)
+sifts_evidence: dict[str, dict[str, list[dict]]] = {}
+for sifts_row in sifts_rows.iter_rows(named=True):
+    sifts_evidence.setdefault(sifts_row["PDB"].lower(), {}).setdefault(sifts_row["SP_PRIMARY"], []).append(sifts_row)
+pdbs_without_sifts = needed_pdbs_lower - set(sifts_chain_uniprots)
+print(f"  {len(sifts_chain_uniprots)}/{len(needed_pdbs_lower)} needed PDBs in SIFTS"
+      + (f"; missing: {sorted(pdbs_without_sifts)}" if pdbs_without_sifts else ""))
+
+# ── MMseq homology (restricted to needed PDBs) ────────────────────────────────
+
+print("Loading MMseq homology hits...")
+homology_hits = (
+    pl.read_parquet(MMSEQ_FILTERED, columns=["protein_id", "hit_pdb_id"])
+    .with_columns(split_hit_id())
+)
+assert homology_hits["hit_chain"].null_count() == 0, "hit_pdb_id without '_<chain>' in filtered MMseq parquet"
+# pdb_lower -> chain -> CP proteins with a homology hit on that chain
+homology_chain_proteins: dict[str, dict[str, list[str]]] = {}
+for pdb_lower, chain, hit_proteins in (
+    homology_hits.filter(pl.col("hit_pdb_lower").is_in(list(needed_pdbs_lower)))
+    .group_by(["hit_pdb_lower", "hit_chain"]).agg(pl.col("protein_id").unique().sort())
+    .iter_rows()
+):
+    homology_chain_proteins.setdefault(pdb_lower, {})[chain] = hit_proteins
+
+# Evidence rows: same filter as the filtered parquet (identity > 30 OR
+# blast_identity > 30, alnlen > 30) applied to the raw parquet, all columns kept.
+mmseq_evidence_rows = (
+    pl.scan_parquet(MMSEQ_RAW)
+    .filter(pl.col("protein_id").is_in(list(all_target_proteins)))
+    .filter((pl.col("identity_percent") > 30) | (pl.col("blast_identity_percent") > 30))
+    .filter(pl.col("alnlen") > 30)
+    .with_columns(split_hit_id())
+    .filter(pl.col("hit_pdb_lower").is_in(list(needed_pdbs_lower)))
+    .collect()
+)
+assert mmseq_evidence_rows["hit_chain"].null_count() == 0, "hit_pdb_id without '_<chain>' in raw MMseq parquet"
+# (protein, pdb_lower) -> raw rows
+mmseq_evidence: dict[tuple[str, str], list[dict]] = {}
+for mmseq_row in mmseq_evidence_rows.drop(["hit_pdb_lower", "hit_chain"]).iter_rows(named=True):
+    hit_pdb_lower = mmseq_row["hit_pdb_id"].split("_", 1)[0].lower()
+    mmseq_evidence.setdefault((mmseq_row["protein_id"], hit_pdb_lower), []).append(mmseq_row)
+print(f"  {len(homology_chain_proteins)} PDBs with homology hits, "
+      f"{len(mmseq_evidence)} protein/PDB evidence groups")
+
+
+# ── per complex ───────────────────────────────────────────────────────────────
+
+def select_cf_run(ac: str, log: list[str]) -> tuple[str, list[dict], dict] | None:
+    """Return (output_folder, scored models, run entry) of the chosen run, or None."""
+    folder_runs = cf_runs_by_complex.get(ac, {})
+    if STOICHIOMETRY_CHOICE == "true":
+        folder_runs = {folder: run for folder, run in folder_runs.items() if "true" in run["labels"]}
+    chosen_run = None
+    for output_folder, run_entry in folder_runs.items():
+        run_label = "/".join(run_entry["labels"])
+        confidence_path = CF_BASE / output_folder / "assembled_results" / "confidence.txt"
+        if not confidence_path.exists():
+            log.append(f"  NOTE run {run_label}: no confidence.txt ({output_folder})")
+            continue
+        scored_models = parse_confidence(confidence_path)
+        if not scored_models:
+            log.append(f"  NOTE run {run_label}: empty confidence.txt ({output_folder})")
+            continue
+        log.append(f"  run {run_label}: top score {scored_models[0]['score']:.2f}")
+        if chosen_run is None or scored_models[0]["score"] > chosen_run[1][0]["score"]:
+            chosen_run = (output_folder, scored_models, run_entry)
+    return chosen_run
+
+
+def process_complex(info_row: dict) -> tuple[str, dict]:
+    ac              = info_row["complex_ac"]
+    target_proteins = target_proteins_by_complex[ac]
+    log = [f"\n{ac}  ref CF={info_row['CF_confidence_max']:.1f}  ({len(target_proteins)} proteins)"]
+
+    # CombFold model
+    cf_models, cf_chain_map, missing_copies, run_labels, run_stoic_label = [], {}, {}, [], ""
+    chosen_run = select_cf_run(ac, log)
+    if chosen_run is None:
+        log.append(f"  WARNING {ac}: no CombFold run with results "
+                   f"(STOICHIOMETRY_CHOICE={STOICHIOMETRY_CHOICE}) -- no CF model shown")
+    else:
+        output_folder, scored_models, run_entry = chosen_run
+        top_model_path = scored_models[0]["path"]
+        assembled_dir = CF_BASE / output_folder / "assembled_results"
+        assert top_model_path.parent.resolve() == assembled_dir.resolve(), (
+            f"{ac}: confidence.txt points outside its folder: {top_model_path}"
+        )
+        assert top_model_path.exists(), f"{ac}: top model missing: {top_model_path}"
+        model_text = strip_pdb(top_model_path.read_text())
+        cf_chain_map, missing_copies = build_cf_chain_map(model_text, output_folder, run_entry["protein_counts"])
+        cf_models = [{"name": top_model_path.name, "score": scored_models[0]["score"],
+                      "pdb_gz": compress(model_text), "folder": output_folder, "path": str(top_model_path)}]
+        run_labels = run_entry["labels"]
+        run_stoic_label = stoic_label(run_entry["protein_counts"])
+        log.append(f"  CF model: {scored_models[0]['score']:.2f} from {'/'.join(run_labels)}")
+        if missing_copies:
+            log.append(f"  WARNING {ac}: partial assembly, missing copies {missing_copies}")
+        spec_proteins = set(run_entry["protein_counts"])
+        if spec_proteins != target_proteins:
+            log.append(f"  NOTE {ac}: spec proteins differ from CP identifiers -- "
+                       f"only in spec {sorted(spec_proteins - target_proteins)}, "
+                       f"only in CP {sorted(target_proteins - spec_proteins)}")
+
+    # input pair models of the chosen run
+    input_models, n_input_models_total = [], 0
+    if chosen_run is not None:
+        input_folder = chosen_run[0].removesuffix("_output") + "_input"
+        input_models, n_input_models_total = read_input_models(input_folder)
+        input_kb = sum(len(m["pdb_gz"]) for m in input_models) // 1024
+        log.append(f"  input pair models: {len(input_models)}/{n_input_models_total} embedded ({input_kb} KB)")
+
+    # reference PDBs
+    cover = pdb_cover_by_complex.get(ac, {"level": None, "pdb_ids": [], "n_total": 0})
+    cover_pdbs = cover["pdb_ids"]
+    if not cover_pdbs:
+        log.append(f"  NOTE {ac}: no PDB set cover")
+    elif cover["n_total"] > MAX_PDB_REFS:
+        log.append(f"  WARNING {ac}: PDB cover has {cover['n_total']} entries, showing {MAX_PDB_REFS}")
+    pdb_chain_map = {
+        pdb_id: {chain: {"u": chain_uniprots, "cp": [u for u in chain_uniprots if u in target_proteins]}
+                 for chain, chain_uniprots in sifts_chain_uniprots.get(pdb_id.lower(), {}).items()}
+        for pdb_id in cover_pdbs
+    }
+    if cover_pdbs:
+        assert any(pdb_chain_map.values()), f"{ac}: none of the cover PDBs {cover_pdbs} is in SIFTS"
+    pdb_homology_map = {
+        pdb_id: {chain: [p for p in hit_proteins if p in target_proteins]
+                 for chain, hit_proteins in homology_chain_proteins.get(pdb_id.lower(), {}).items()}
+        for pdb_id in cover_pdbs
+    }
+    pdb_protein_evidence: dict[str, dict[str, dict]] = {}
+    for pdb_id in cover_pdbs:
+        pdb_lower = pdb_id.lower()
+        per_protein_evidence = {}
+        for protein in sorted(target_proteins):
+            direct_rows   = sifts_evidence.get(pdb_lower, {}).get(protein, [])
+            homology_rows = mmseq_evidence.get((protein, pdb_lower), [])
+            if direct_rows or homology_rows:
+                per_protein_evidence[protein] = {"direct": direct_rows, "homology": homology_rows}
+        pdb_protein_evidence[pdb_id] = per_protein_evidence
+    complex_pdb_proteins = pdb_proteins_by_complex.get(ac, {})
 
     entry = {
-        "complex_ac"     : ac,
-        "identifiers"    : identifiers,
-        "cf_confidence"  : cf_max,
-        "match_class"    : match_class,
-        "stoic_label"    : best_label,
-        "cf_models"      : cf_models_clean,
-        "pdb_ids"        : cover,
-        "pdb_cap_hit"    : pdb_cap_hit,
-        "cp_proteins"    : sorted(target),
-        "cf_chain_map"   : cf_chain_map,
-        "cp_annotation"  : cp_annotation_lookup.get(ac),
-        "pdb_proteins"   : {pid: pdb_proteins.get(pid, []) for pid in cover},
-        "pdb_annotation" : {pid: pdb_annotation_lookup.get((ac, pid.lower())) for pid in cover},
-        "pdb_chain_map": {
-            pid: build_pdb_chain_map(pid, sifts_lookup, target)
-            for pid in cover
-        },
-        "pdb_homology_map": {
-            pid: build_pdb_homology_map(pid, homology_lookup, target)
-            for pid in cover
-        },
-        "input_models": input_models_list,
+        "complex_ac"           : ac,
+        "identifiers"          : info_row["identifiers"],
+        "cf_confidence"        : cf_models[0]["score"] if cf_models else None,
+        "cf_confidence_ref"    : float(info_row["CF_confidence_max"]),
+        "match_class"          : info_row["match_class"] or "unknown",
+        "stoic_label"          : run_stoic_label,
+        "run_labels"           : run_labels,
+        "assembly_missing"     : missing_copies,
+        "cf_models"            : cf_models,
+        "cf_chain_map"         : cf_chain_map,
+        "cp_proteins"          : sorted(target_proteins),
+        "cp_annotation"        : cp_annotation_by_complex.get(ac),
+        "pdb_ids"              : cover_pdbs,
+        "pdb_cover_level"      : cover["level"],
+        "pdb_n_total"          : cover["n_total"],
+        "pdb_cap_hit"          : cover["n_total"] > MAX_PDB_REFS,
+        "pdb_proteins"         : {pdb_id: complex_pdb_proteins.get(pdb_id, []) for pdb_id in cover_pdbs},
+        "pdb_annotation"       : {pdb_id: pdb_annotation_by_pair.get((ac, pdb_id.lower())) for pdb_id in cover_pdbs},
+        "pdb_chain_map"        : pdb_chain_map,
+        "pdb_homology_map"     : pdb_homology_map,
+        "pdb_protein_evidence" : pdb_protein_evidence,
+        "input_models"         : input_models,
+        "input_n_total"        : n_input_models_total,
+        "input_cap_hit"        : n_input_models_total > len(input_models),
     }
-
-    # Verify that PDB chain maps are actually populated from SIFTS
-    if cover:
-        mapped = [pid for pid in cover if entry["pdb_chain_map"].get(pid)]
-        assert mapped, (
-            f"No PDB chain maps populated for {ac} (PDB IDs: {cover}). "
-            f"Check that SIFTS covers these PDB entries."
-        )
-    if entry["cp_annotation"] is None:
-        log.append(f"  NOTE: no Complex Portal annotation found for {ac}")
-
     tqdm.write("\n".join(log))
     return ac, entry
 
 
-# I/O-bound (file reads, gzip compression releases the GIL) and each complex
-# is independent, so this parallelizes cleanly -- mirrors the
-# ThreadPoolExecutor(max_workers=16) pattern used elsewhere in this pipeline.
-# executor.map preserves input order, so EMBED still ends up sorted by
-# CF_confidence_max descending (same dropdown order as before), regardless
-# of which complex's thread happens to finish first.
-_rows = list(complexes_df.iter_rows(named=True))
-with ThreadPoolExecutor(max_workers=16) as executor:
-    for ac, entry in tqdm(executor.map(process_complex, _rows), total=len(_rows),
-                           desc="Assembling complexes"):
-        EMBED[ac] = entry
+# File reads + gzip release the GIL, complexes are independent -> threads.
+complex_entries: dict[str, dict] = {}
+with ThreadPoolExecutor(max_workers=N_THREADS) as executor:
+    for ac, entry in tqdm(executor.map(process_complex, complex_info.iter_rows(named=True)),
+                          total=complex_info.height, desc="Assembling complexes"):
+        complex_entries[ac] = entry
 
+# Dropdown order: trimmed CF score, best first; complexes without a model last.
+complex_entries = dict(sorted(
+    complex_entries.items(),
+    key=lambda item: (item[1]["cf_confidence"] is None, -(item[1]["cf_confidence"] or 0.0)),
+))
 
-# ── detailed per-protein evidence (for click-to-inspect in the viewer) ─────
-print("\nBuilding per-protein evidence (SIFTS + MMseq detail) for covered PDBs...")
-
-used_pdbs_lower: set[str] = set()
-all_target_proteins: set[str] = set()
-for entry in EMBED.values():
-    used_pdbs_lower.update(p.lower() for p in entry["pdb_ids"])
-    all_target_proteins.update(entry["cp_proteins"])
-
-# SIFTS detail: pdb_lower -> accession -> list of raw row dicts. All columns
-# are passed through as-is (only CHAIN/SP_PRIMARY are known for certain) so
-# whatever range/extra columns the real SIFTS file has are never silently
-# dropped or mislabeled.
-sifts_detail: dict[str, dict[str, list[dict]]] = {}
-sifts_detail_df = sifts_df.filter(
-    pl.col(pdb_col).str.to_lowercase().is_in(list(used_pdbs_lower))
-)
-for r in sifts_detail_df.iter_rows(named=True):
-    pdb_l = (r[pdb_col] or "").lower()
-    acc   = r["SP_PRIMARY"]
-    if not pdb_l or not acc:
-        continue
-    sifts_detail.setdefault(pdb_l, {}).setdefault(acc, []).append(r)
-n_sifts_detail = sum(len(v2) for v in sifts_detail.values() for v2 in v.values())
-print(f"  SIFTS detail rows kept: {n_sifts_detail}")
-
-# MMseq detail: reproduces the filtering given verbatim (identity>30 OR
-# blast_identity>30, alnlen>30), restricted to proteins appearing in at
-# least one target complex, from the RAW (unfiltered) mmseq parquet.
-assert MMSEQ_RAW.exists(), f"MMseq raw parquet not found: {MMSEQ_RAW}"
-mmseqs_raw = pl.read_parquet(MMSEQ_RAW)
-mmseqs_detail_df = (
-    mmseqs_raw
-    .filter(pl.col("protein_id").is_in(list(all_target_proteins)))
-    .filter((pl.col("identity_percent") > 30) | (pl.col("blast_identity_percent") > 30))
-    .filter(pl.col("alnlen") > 30)
-)
-mmseqs_detail: dict[tuple[str, str], list[dict]] = {}
-for r in mmseqs_detail_df.iter_rows(named=True):
-    hit = r.get("hit_pdb_id") or ""
-    parts = hit.split("_", 1)
-    if len(parts) < 2:
-        continue
-    pdb_l, chain = parts[0].lower(), parts[1]
-    if pdb_l not in used_pdbs_lower:
-        continue
-    mmseqs_detail.setdefault((r["protein_id"], pdb_l), []).append(r)
-print(f"  MMseq detail hit-groups kept: {len(mmseqs_detail)}")
-
-# Attach, per complex/pdb/protein, whatever evidence exists. Entries with
-# no evidence at all are omitted rather than padding the JSON with
-# empty lists.
-for entry in EMBED.values():
-    evidence: dict[str, dict[str, dict]] = {}
-    for pid in entry["pdb_ids"]:
-        pid_l = pid.lower()
-        per_pdb = {}
-        for protein in entry["cp_proteins"]:
-            direct   = sifts_detail.get(pid_l, {}).get(protein, [])
-            homology = mmseqs_detail.get((protein, pid_l), [])
-            if direct or homology:
-                per_pdb[protein] = {"direct": direct, "homology": homology}
-        evidence[pid] = per_pdb
-    entry["pdb_protein_evidence"] = evidence
+complexes_without_model = [ac for ac, entry in complex_entries.items() if not entry["cf_models"]]
+complexes_partial = {ac: entry["assembly_missing"] for ac, entry in complex_entries.items()
+                     if entry["assembly_missing"]}
+print(f"\n{len(complexes_without_model)}/{len(complex_entries)} complexes without CF model: "
+      f"{complexes_without_model}", file=sys.stderr)
+print(f"{len(complexes_partial)}/{len(complex_entries)} complexes with partial assembly: "
+      f"{complexes_partial}", file=sys.stderr)
 
 
 # ── HTML template ─────────────────────────────────────────────────────────────
@@ -661,7 +613,6 @@ body {
 .mapped-summary.right { text-align:right; }
 .mapped-summary .m-blue   { color:#0072B2; font-weight:600; }
 .mapped-summary .m-off    { color:#999;    font-weight:600; }
-.mapped-summary .m-purple { color:#8E5FBF; font-weight:600; }
 .cp-annotation {
   flex-basis:100%; font-size:12px; font-weight:600; color:#333;
   white-space:normal; line-height:1.35;
@@ -674,8 +625,10 @@ body {
   font-size:11px; font-weight:600; color:#a83232;
   background:#fde3e3; border:1px solid #f0b3b3;
   border-radius:4px; padding:1px 8px; display:none;
+  max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
 .cap-warning.on { display:inline-block; }
+.cover-level { font-size:11px; color:#777; white-space:nowrap; }
 .color-ctrl {
   margin-left:auto; display:flex; align-items:center;
   gap:6px; font-weight:normal; white-space:nowrap; font-size:12px;
@@ -693,20 +646,11 @@ body {
   border:1px solid #ccc; border-radius:3px; font-size:12px;
 }
 .plddt-ctrl input:disabled { opacity:.4; }
-.plddt-mode-label {
-  display:flex; align-items:center; gap:3px; cursor:pointer;
-}
+.plddt-mode-label { display:flex; align-items:center; gap:3px; cursor:pointer; }
 .plddt-mode-label input[type=radio] { margin:0; cursor:pointer; }
-.plddt-legend {
-  display:flex; align-items:center; gap:4px; font-size:11px; color:#666;
-}
-.plddt-legend .sw {
-  display:inline-block; width:9px; height:9px; border-radius:2px;
-}
-.panels {
-  display:grid; grid-template-columns:1fr 1fr;
-  gap:8px; flex:1; min-height:0;
-}
+.plddt-legend { display:flex; align-items:center; gap:4px; font-size:11px; color:#666; }
+.plddt-legend .sw { display:inline-block; width:9px; height:9px; border-radius:2px; }
+.panels { display:grid; grid-template-columns:1fr 1fr; gap:8px; flex:1; min-height:0; }
 .panel {
   background:white; border:1px solid #ddd; border-radius:6px;
   display:flex; flex-direction:column; overflow:hidden;
@@ -720,8 +664,7 @@ body {
 .panel-body { flex:1; position:relative; min-height:0; }
 .viewer3d   { width:100%; height:100%; }
 .overlay {
-  position:absolute; inset:0;
-  background:rgba(255,255,255,.82);
+  position:absolute; inset:0; background:rgba(255,255,255,.82);
   display:none; align-items:center; justify-content:center;
   font-size:13px; color:#555; text-align:center; padding:20px;
 }
@@ -750,8 +693,6 @@ body {
 .pdb-btn:hover { background:#e4e4e4; }
 .pdb-btn.active { background:#0072B2; color:white; border-color:#0072B2; }
 .pdb-btn.cached { border-color:#009E73; }
-
-/* right-panel mode toggle */
 .right-mode-tabs { display:flex; gap:3px; align-items:center; flex-shrink:0; }
 .mode-tab {
   background:#f0f0f0; border:1px solid #ccc; border-radius:4px;
@@ -761,23 +702,18 @@ body {
 .mode-tab:hover:not(.active):not(:disabled) { background:#e4e4e4; }
 .mode-tab.active  { background:#0072B2; color:white; border-color:#0072B2; }
 .mode-tab:disabled { opacity:.38; cursor:not-allowed; }
-
-/* input pair buttons */
 .input-list { display:flex; gap:5px; flex-wrap:wrap; }
 .input-btn {
   background:#f2f2f2; border:1px solid #ccc; border-radius:4px;
   cursor:pointer; padding:2px 10px;
   font-size:12px; font-family:monospace; font-weight:600;
-  max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
 .input-btn:hover { background:#e4e4e4; }
 .input-btn.active { background:#009E73; color:white; border-color:#009E73; }
-
 .protein-link { cursor:pointer; text-decoration:underline dotted; }
 .protein-link:hover { opacity:.7; }
-.evidence-backdrop {
-  position:fixed; inset:0; background:rgba(0,0,0,.35); display:none; z-index:50;
-}
+.evidence-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.35); display:none; z-index:50; }
 .evidence-backdrop.on { display:block; }
 .evidence-popup {
   position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
@@ -806,6 +742,7 @@ body {
   <span class="badge badge-cf"    id="badge-cf"></span>
   <span class="badge badge-match" id="badge-match"></span>
   <span id="stoic-label" title=""></span>
+  <span id="assembly-warning" class="cap-warning"></span>
   <div class="color-ctrl">
     Color:
     <select id="color-mode">
@@ -857,14 +794,14 @@ body {
   <div class="panel">
     <div class="panel-hdr">
       <div class="right-mode-tabs">
-        <button class="mode-tab active" id="tab-pdb"
-                onclick="setRightMode('pdb')">PDB Ref</button>
-        <button class="mode-tab" id="tab-input"
-                onclick="setRightMode('input')">Input Pairs</button>
+        <button class="mode-tab active" id="tab-pdb"   onclick="setRightMode('pdb')">PDB Ref</button>
+        <button class="mode-tab"        id="tab-input" onclick="setRightMode('input')">Input Pairs</button>
       </div>
       <div class="pdb-list"   id="pdb-list"></div>
       <div class="input-list" id="input-list" style="display:none"></div>
+      <span id="pdb-cover-level" class="cover-level"></span>
       <span id="pdb-cap-warning" class="cap-warning"></span>
+      <span id="input-cap-warning" class="cap-warning" style="display:none"></span>
       <span id="pdb-mapped-summary" class="mapped-summary right"></span>
       <span id="pdb-annotation" class="pdb-annotation"></span>
     </div>
@@ -894,9 +831,6 @@ const CC = ['#0072B2','#E69F00','#009E73','#CC79A7',
             '#56B4E9','#D55E00','#F0E442','#999999'];
 const YELLOW = '#E69F00';
 const GRAY   = '#bbbbbb';
-const PURPLE = '#B39DDB'; /* "identity unknown" -- distinct from both YELLOW
-                              (mapped, not covered) and GRAY (mapped, no hit).
-                              Never means "confirmed uncovered". */
 
 const LABEL_STYLE = {
   backgroundColor: 'black', backgroundOpacity: 0.75,
@@ -906,126 +840,87 @@ const LABEL_STYLE = {
 /* ── gzip decompress ──────────────────────────────────────────────────── */
 async function ungzip(b64) {
   const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-  const ds  = new DecompressionStream('gzip');
-  const w   = ds.writable.getWriter();
-  w.write(raw); w.close();
-  const chunks = [];
-  const r = ds.readable.getReader();
-  for (;;) { const {done,value} = await r.read(); if (done) break; chunks.push(value); }
-  let len=0, off=0;
-  chunks.forEach(c => len+=c.length);
-  const buf = new Uint8Array(len);
-  chunks.forEach(c => { buf.set(c,off); off+=c.length; });
-  return new TextDecoder().decode(buf);
+  const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return await new Response(stream).text();
 }
 
 /* ── state ────────────────────────────────────────────────────────────── */
-let cfV=null, pdbV=null, cur=null, mIdx=0;
+let cfV = null, pdbV = null, cur = null, mIdx = 0;
 let colorMode      = 'single';
-let plddtThreshold = 0;          // hide atoms with pLDDT (B-factor) below this, AF models only
-let plddtMode      = 'threshold'; // 'threshold' (fixed value, slider or typed) | 'top50' (per-chain median split)
-let cfRaw        = null, pdbRaw = null, pdbFmtCur = 'pdb';
+let plddtThreshold = 0;            // AF models only
+let plddtMode      = 'threshold';  // 'threshold' | 'top50'
+let cfRaw = null, pdbRaw = null, pdbFmtCur = 'pdb';
 let currentPdbId = null;
 
-/* ── pLDDT (AlphaFold DB standard 4-bin palette) ─────────────────────────
-   Applies to B-factor columns of AF3 models (CombFold assembly, input
-   pairwise predictions) where B-factor was overloaded to store pLDDT.
-   NOT meaningful for real crystallographic reference PDBs -- never
-   applied there. */
+let rightMode       = 'pdb';   // 'pdb' | 'input'
+let currentInputIdx = -1;
+let inputChainMap   = {};      // chain -> UniProt of the displayed input model (from Python)
+
+/* Reference PDB cache for the CURRENT complex only; pdbCacheOwner guards
+   against late fetches from a previously selected complex. */
+let pdbCache      = {};
+let pdbCacheOwner = null;
+
+/* ── pLDDT (AF DB 4-bin palette); AF models only, never crystal PDBs ──── */
 function plddtColor(atom) {
   const b = atom.b;
-  if (b == null)  return GRAY;
-  if (b > 90)     return '#0053D6';
-  if (b > 70)     return '#65CBF3';
-  if (b > 50)     return '#FFDB13';
+  if (b == null) return GRAY;
+  if (b > 90)    return '#0053D6';
+  if (b > 70)    return '#65CBF3';
+  if (b > 50)    return '#FFDB13';
   return '#FF7D45';
 }
 
-/* Hide (clear style on) atoms whose B-factor/pLDDT falls below the active
-   cutoff, on top of whatever cartoon style/coloring was just applied.
-   Must be called AFTER setStyle for the visible atoms, since setStyle
-   with an empty style object here overrides them for the hidden subset.
-   Dispatches on the global plddtMode -- see applyThresholdFilter (fixed
-   cutoff, from slider or typed number) and applyTop50Filter (per-chain
-   median split) below. */
+/* Must run AFTER setStyle: clears style on atoms below the active cutoff. */
 function applyPlddtFilter(v) {
   if (plddtMode === 'top50') applyTop50Filter(v);
   else                       applyThresholdFilter(v, plddtThreshold);
 }
 
-/* Fixed cutoff: hide any atom with pLDDT < threshold. No-op at 0. */
 function applyThresholdFilter(v, threshold) {
   if (!threshold) return;
   const below = v.selectedAtoms({}).filter(a => a.b != null && a.b < threshold);
-  if (below.length) {
-    v.setStyle({serial: below.map(a => a.serial)}, {});
-  }
+  if (below.length) v.setStyle({serial: below.map(a => a.serial)}, {});
 }
 
-/* Per-chain "top 50%": for each chain independently, compute the median
-   pLDDT (B-factor) across that chain's atoms and hide whichever atoms
-   fall below it -- i.e. keep only the upper half of each chain's own
-   pLDDT distribution. Computed per chain (not globally) so a uniformly
-   confident chain doesn't get needlessly thinned out just because
-   another chain in the same model is worse, and vice versa. */
+/* Per chain: hide atoms below that chain's own median pLDDT. */
 function applyTop50Filter(v) {
   const atoms = v.selectedAtoms({}).filter(a => a.b != null);
   if (!atoms.length) return;
-
   const byChain = {};
   atoms.forEach(a => (byChain[a.chain] ||= []).push(a.b));
-
   const chainMedian = {};
   for (const [ch, vals] of Object.entries(byChain)) {
     vals.sort((x, y) => x - y);
     const mid = vals.length >> 1;
-    chainMedian[ch] = (vals.length % 2)
-      ? vals[mid]
-      : (vals[mid - 1] + vals[mid]) / 2;
+    chainMedian[ch] = (vals.length % 2) ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
   }
-
   const below = atoms.filter(a => a.b < chainMedian[a.chain]);
-  if (below.length) {
-    v.setStyle({serial: below.map(a => a.serial)}, {});
-  }
+  if (below.length) v.setStyle({serial: below.map(a => a.serial)}, {});
 }
 
-/* right-panel input-pair mode */
-let rightMode       = 'pdb';   // 'pdb' | 'input'
-let currentInputIdx = -1;
-let inputRaw        = null;
-let inputChainMap   = {};       // chain letter → UniProt for displayed input model
-
-/* pdbCache: { pid: {text, fmt, title} } -- holds all reference PDBs for the
-   CURRENTLY SELECTED complex only. pdbCacheOwner tags which complex_ac
-   the cache belongs to; selectComplex() resets both on every switch, and
-   any in-flight fetch checks pdbCacheOwner before writing to the cache so
-   a stale background fetch from a since-abandoned complex can't pollute
-   the new one's cache. 'title' is the RCSB entry title, fetched alongside
-   the structure and used as a fallback when no Complex Portal annotation
-   exists for that PDB. */
-let pdbCache      = {};
-let pdbCacheOwner = null;
-
-/* ── right-panel mode: PDB Ref ↔ Input Pairs ─────────────────────────── */
+/* ── right-panel mode: PDB Ref <-> Input Pairs ────────────────────────── */
 function setRightMode(mode) {
   rightMode = mode;
-  document.getElementById('tab-pdb').classList.toggle('active',   mode === 'pdb');
-  document.getElementById('tab-input').classList.toggle('active',  mode === 'input');
-  document.getElementById('pdb-list').style.display    = mode === 'pdb'   ? '' : 'none';
-  document.getElementById('input-list').style.display  = mode === 'input' ? '' : 'none';
-  document.getElementById('pdb-cap-warning').style.display = mode === 'pdb' ? '' : 'none';
+  const isPdb = mode === 'pdb';
+  document.getElementById('tab-pdb').classList.toggle('active',  isPdb);
+  document.getElementById('tab-input').classList.toggle('active', !isPdb);
+  document.getElementById('pdb-list').style.display          = isPdb ? '' : 'none';
+  document.getElementById('pdb-cover-level').style.display   = isPdb ? '' : 'none';
+  document.getElementById('pdb-cap-warning').style.display   = isPdb ? '' : 'none';
+  document.getElementById('input-list').style.display        = isPdb ? 'none' : '';
+  document.getElementById('input-cap-warning').style.display = isPdb ? 'none' : '';
   document.getElementById('pdb-mapped-summary').innerHTML = '';
 
-  if (mode === 'pdb') {
-    // restore CF coloring to the current color-mode
+  if (isPdb) {
     if (cfRaw) styleViewer(cfV, cfRaw, 'pdb', 'cf');
-    // restore current reference PDB (use cache if available)
     if (currentPdbId && pdbCache[currentPdbId]) {
       const {text, fmt} = pdbCache[currentPdbId];
       styleViewer(pdbV, text, fmt, 'pdb');
     } else if (currentPdbId) {
       loadPDB(currentPdbId);
+    } else {
+      pdbV.removeAllModels(); pdbV.render();
     }
     updateAnnotations();
     updateMappedSummaries();
@@ -1036,8 +931,6 @@ function setRightMode(mode) {
       loadInputModel(0);
     } else {
       pdbV.removeAllModels(); pdbV.render();
-      spin('pdb-overlay', true, 'No input models embedded for this complex.');
-      setTimeout(() => spin('pdb-overlay', false), 4000);
     }
     updateAnnotations();
   }
@@ -1060,7 +953,6 @@ async function loadInputModel(idx) {
   const models = cur?.input_models || [];
   if (!cur || idx < 0 || idx >= models.length) return;
   currentInputIdx = idx;
-
   document.querySelectorAll('.input-btn')
     .forEach((b, i) => b.classList.toggle('active', i === idx));
 
@@ -1068,19 +960,8 @@ async function loadInputModel(idx) {
   spin('pdb-overlay', true, 'Loading input pair...');
   try {
     const text = await ungzip(m.pdb_gz);
-    inputRaw   = text;
-
-    /* chain-letter → UniProt: chains in appearance order → proteins[0], proteins[1] */
-    const chains = [...new Set(
-      text.split('\n')
-        .filter(l => l.startsWith('ATOM') && l.length > 21)
-        .map(l => l[21])
-    )];
-    inputChainMap = {};
-    chains.forEach((ch, i) => {
-      inputChainMap[ch] = m.proteins[Math.min(i, m.proteins.length - 1)];
-    });
-
+    if (cur?.input_models?.[currentInputIdx] !== m) return;  // user moved on meanwhile
+    inputChainMap = m.chain_map;
     styleInputViewer(text, m.proteins);
     spin('pdb-overlay', false);
     if (cfRaw) highlightCFPair(m.proteins);
@@ -1089,29 +970,24 @@ async function loadInputModel(idx) {
   } catch (e) {
     console.error(e);
     spin('pdb-overlay', true, 'Failed to load: ' + e.message);
-    setTimeout(() => spin('pdb-overlay', false), 3500);
   }
 }
 
-/* Color the input-pair viewer: chain A → blue, chain B → green (both blue
-   for homodimers).  These colors are intentionally never yellow so the
-   pair is always distinguishable from the rest of the CF assembly. */
+/* Input pair: protein1 chain -> blue, protein2 chain -> green (homodimer: both blue). */
 function styleInputViewer(text, proteins) {
   pdbV.removeAllModels();
   const model  = pdbV.addModel(text, 'pdb');
-  const chains = [...new Set(model.selectedAtoms({}).map(a => a.chain))].sort();
+  const chains = [...new Set(model.selectedAtoms({}).map(a => a.chain))];
   const homo   = proteins[0] === proteins[1];
 
-  chains.forEach((ch, i) => {
+  chains.forEach(ch => {
     if (colorMode === 'plddt') {
       pdbV.setStyle({chain: ch}, {cartoon: {colorfunc: plddtColor}});
       return;
     }
-    const color = homo ? CC[0] : (i === 0 ? CC[0] : CC[2]); // blue / green
+    const color = (homo || inputChainMap[ch] === proteins[0]) ? CC[0] : CC[2];
     pdbV.setStyle({chain: ch}, {cartoon: {color}});
   });
-
-  /* Input pairs are AF3 predictions too -- B-factor is pLDDT, filter applies. */
   applyPlddtFilter(pdbV);
 
   pdbV.setHoverable({}, true,
@@ -1119,85 +995,56 @@ function styleInputViewer(text, proteins) {
       const u = inputChainMap[atom.chain];
       const plddt = atom.b != null ? '  |  pLDDT ' + atom.b.toFixed(1) : '';
       v.removeAllLabels();
-      v.addLabel(
-        (u ? 'Chain ' + atom.chain + ': ' + u : 'Chain ' + atom.chain) + plddt,
-        {...LABEL_STYLE, position: atom}
-      );
+      v.addLabel('Chain ' + atom.chain + ': ' + u + plddt, {...LABEL_STYLE, position: atom});
       v.render();
     },
     (atom, v) => { v.removeAllLabels(); v.render(); }
   );
-
   pdbV.zoomTo(); pdbV.render();
 }
 
-/* Highlight CF assembly chains that belong to the selected input pair,
-   using the SAME colors as the right-panel input viewer so chains can be
-   matched by color across both panels:
-     proteins[0] chains → blue  (CC[0])
-     proteins[1] chains → green (CC[2])   (or blue too if homodimer)
-     all other chains   → yellow (YELLOW) — fully visible, just distinguished */
+/* CF assembly in input mode: pair proteins in the same colors as the right
+   panel (blue / green), all other chains yellow. */
 function highlightCFPair(proteins) {
   if (!cfRaw) return;
   const homo = proteins[0] === proteins[1];
-
   cfV.removeAllModels();
   const model  = cfV.addModel(cfRaw, 'pdb');
-  const chains = [...new Set(model.selectedAtoms({}).map(a => a.chain))].sort();
-
+  const chains = [...new Set(model.selectedAtoms({}).map(a => a.chain))];
   chains.forEach(ch => {
-    const u = cur?.cf_chain_map?.[ch];
-    let color;
-    if (homo && u === proteins[0]) {
-      color = CC[0];    // homodimer: all copies blue
-    } else if (u === proteins[0]) {
-      color = CC[0];    // blue — matches right-panel chain A
-    } else if (u === proteins[1]) {
-      color = CC[2];    // green — matches right-panel chain B
-    } else {
-      color = YELLOW;   // rest of complex: visible but clearly distinct
-    }
+    const u = cur.cf_chain_map[ch];
+    let color = YELLOW;
+    if (u === proteins[0])               color = CC[0];
+    else if (!homo && u === proteins[1]) color = CC[2];
     cfV.setStyle({chain: ch}, {cartoon: {color}});
   });
-
   applyPlddtFilter(cfV);
-
   cfV.setHoverable({}, true, cfHoverCB, cfUnhoverCB);
   cfV.zoomTo(); cfV.render();
   updateMappedSummaries();
 }
 
-/* ── viewers + hover ──────────────────────────────────────────────────── */
-/* Hover callbacks are named + module-level so styleViewer() can re-register
-   them on every new model. setHoverable() only flags the atoms that exist
-   in the viewer AT THE MOMENT IT IS CALLED -- it does nothing for atoms
-   added afterwards. Previously this was called once here in initViewers(),
-   before any model had been loaded (getAtomsFromSel({}) matched zero
-   atoms), so no atom ever got hoverable=true and hovering silently did
-   nothing. Fix: call setHoverable again after every addModel() (see
-   styleViewer below). */
+/* ── hover callbacks (re-registered after every addModel) ─────────────── */
 function cfHoverCB(atom, viewer) {
   const u = cur?.cf_chain_map?.[atom.chain];
   const plddt = atom.b != null ? '  |  pLDDT ' + atom.b.toFixed(1) : '';
   viewer.removeAllLabels();
-  viewer.addLabel(
-    (u ? 'Chain ' + atom.chain + ': ' + u : 'Chain ' + atom.chain + ' (unmapped)') + plddt,
-    {...LABEL_STYLE, position: atom}
-  );
+  viewer.addLabel('Chain ' + atom.chain + ': ' + u + plddt, {...LABEL_STYLE, position: atom});
   viewer.render();
 }
 function cfUnhoverCB(atom, viewer) { viewer.removeAllLabels(); viewer.render(); }
 
 function pdbHoverCB(atom, viewer) {
   const info     = cur?.pdb_chain_map?.[currentPdbId]?.[atom.chain];
-  const homology = cur?.pdb_homology_map?.[currentPdbId]?.[atom.chain];
+  const homology = cur?.pdb_homology_map?.[currentPdbId]?.[atom.chain] || [];
   let text = 'Chain ' + atom.chain;
-  if (info) text += ' | SIFTS: ' + info.u + (info.cp ? ' (direct match)' : ' (not in complex)');
-  if (homology && homology.length > 0) text += ' | homology: ' + homology.join(', ');
-  if (!info && (!homology || homology.length === 0)) text += ' (no mapping)';
-  /* This is a crystallographic reference structure, so B-factor here is a
-     real B-factor, not pLDDT -- labeled accordingly to avoid confusion. */
-  if (atom.b != null) text += '  |  B-factor ' + atom.b.toFixed(1);
+  if (info) {
+    text += ' | SIFTS: ' + info.u.join(', ')
+          + (info.cp.length ? ' (in complex: ' + info.cp.join(', ') + ')' : ' (not in complex)');
+  }
+  if (homology.length) text += ' | homology: ' + homology.join(', ');
+  if (!info && !homology.length) text += ' (no mapping)';
+  if (atom.b != null) text += '  |  B-factor ' + atom.b.toFixed(1);  /* crystal B-factor, not pLDDT */
   viewer.removeAllLabels();
   viewer.addLabel(text, {...LABEL_STYLE, position: atom});
   viewer.render();
@@ -1205,7 +1052,7 @@ function pdbHoverCB(atom, viewer) {
 function pdbUnhoverCB(atom, viewer) { viewer.removeAllLabels(); viewer.render(); }
 
 function initViewers() {
-  const opts = {backgroundColor:'white', antialias:true};
+  const opts = {backgroundColor: 'white', antialias: true};
   cfV  = $3Dmol.createViewer(document.getElementById('cf-viewer'),  opts);
   pdbV = $3Dmol.createViewer(document.getElementById('pdb-viewer'), opts);
 }
@@ -1216,67 +1063,41 @@ function styleViewer(v, text, fmt, storeAs) {
   if (storeAs === 'pdb') { pdbRaw = text; pdbFmtCur = fmt; }
 
   v.removeAllModels();
-  const model      = v.addModel(text, fmt);
-  const chains     = [...new Set(model.selectedAtoms({}).map(a => a.chain))].sort();
-  const cpProteins = cur?.cp_proteins || [];
+  const model  = v.addModel(text, fmt);
+  const chains = [...new Set(model.selectedAtoms({}).map(a => a.chain))].sort();
 
-  /* re-register hoverable on THIS model's atoms -- see note in initViewers() */
   if (storeAs === 'cf') v.setHoverable({}, true, cfHoverCB, cfUnhoverCB);
   else                  v.setHoverable({}, true, pdbHoverCB, pdbUnhoverCB);
 
   chains.forEach((ch, i) => {
-    let color;
     if (colorMode === 'plddt') {
-      v.setStyle({chain:ch}, {cartoon:{colorfunc: plddtColor}});
+      v.setStyle({chain: ch}, {cartoon: {colorfunc: plddtColor}});
       return;
-    } else if (colorMode === 'by-chain') {
+    }
+    let color;
+    if (colorMode === 'by-chain') {
       color = CC[i % CC.length];
     } else if (colorMode === 'single') {
       color = YELLOW;
+    } else if (storeAs === 'cf') {
+      /* by-mapping, CF: blue if the chain's protein is in the shown PDB, else yellow */
+      const pdbProts = cur?.pdb_proteins?.[currentPdbId] || [];
+      color = pdbProts.includes(cur.cf_chain_map[ch]) ? CC[0] : YELLOW;
     } else {
-      /* by-mapping:
-         CF chain  = blue if its UniProt (via cf_chain_map) is among the
-                      currently shown PDB's proteins, yellow if it's known
-                      but not covered, PURPLE if the chain has no identity
-                      at all (cf_chain_map has no entry for it -- an
-                      "unknown", never treated as "confirmed uncovered").
-         PDB chain = blue if EITHER a direct SIFTS match (chain's own
-                      UniProt is a CP protein) OR a cross-species homology
-                      hit says so; gray otherwise. Both are independent
-                      pieces of positive evidence and must be combined,
-                      not just the homology one. */
-      if (storeAs === 'cf') {
-        const uniprot = cur?.cf_chain_map?.[ch];
-        if (!uniprot) {
-          color = PURPLE;
-        } else {
-          const pdbProts = cur?.pdb_proteins?.[currentPdbId] || [];
-          color = pdbProts.includes(uniprot) ? '#0072B2' : YELLOW;
-        }
-      } else {
-        const chainInfo   = cur?.pdb_chain_map?.[currentPdbId]?.[ch];
-        const homologyHit = cur?.pdb_homology_map?.[currentPdbId]?.[ch];
-        const mapped = (chainInfo && chainInfo.cp) || (homologyHit && homologyHit.length > 0);
-        color = mapped ? '#0072B2' : GRAY;
-      }
+      /* by-mapping, PDB: blue if direct SIFTS match OR homology hit to a CP protein */
+      const chainInfo   = cur?.pdb_chain_map?.[currentPdbId]?.[ch];
+      const homologyHit = cur?.pdb_homology_map?.[currentPdbId]?.[ch] || [];
+      color = ((chainInfo && chainInfo.cp.length) || homologyHit.length) ? CC[0] : GRAY;
     }
-    v.setStyle({chain:ch}, {cartoon:{color}});
+    v.setStyle({chain: ch}, {cartoon: {color}});
   });
 
-  /* pLDDT threshold filter only makes sense for AF3-derived models; the
-     CF assembly panel always is one, the reference PDB panel (crystal
-     structures, real B-factors) never is. */
-  if (storeAs === 'cf') applyPlddtFilter(v);
-
+  if (storeAs === 'cf') applyPlddtFilter(v);  /* AF-derived only */
   v.zoomTo(); v.render();
   updateMappedSummaries();
 }
 
-/* ── protein click-to-inspect popup ──────────────────────────────────────
-   renderGroup builds the Mapped/Novel/No-hit summary lines with each
-   protein as a clickable span; clicking one opens a popup showing the
-   raw SIFTS + MMseq evidence rows for that protein against the currently
-   selected reference PDB. */
+/* ── protein click-to-inspect popup ───────────────────────────────────── */
 function renderGroup(el, groups) {
   el.innerHTML = '';
   let wroteAny = false;
@@ -1313,9 +1134,6 @@ function buildEvidenceSection(title, rows, preferredCols) {
     wrap.appendChild(p);
     return wrap;
   }
-  /* preferred columns first (if present), then anything else the row
-     actually has -- so real data is never silently hidden just because
-     we didn't anticipate the column name */
   const allCols = new Set();
   rows.forEach(r => Object.keys(r).forEach(k => allCols.add(k)));
   const cols = [
@@ -1331,8 +1149,8 @@ function buildEvidenceSection(title, rows, preferredCols) {
     const tr = document.createElement('tr');
     cols.forEach(c => {
       const td = document.createElement('td');
-      const v = r[c];
-      td.textContent = (v === null || v === undefined) ? '' : String(v);
+      const val = r[c];
+      td.textContent = (val === null || val === undefined) ? '' : String(val);
       tr.appendChild(td);
     });
     table.appendChild(tr);
@@ -1347,8 +1165,7 @@ function showEvidencePopup(protein) {
     protein + '  vs  ' + (currentPdbId ? currentPdbId.toUpperCase() : '?');
   const body = document.getElementById('evidence-popup-body');
   body.innerHTML = '';
-  body.appendChild(buildEvidenceSection('Direct SIFTS match', ev?.direct || [],
-    ['CHAIN', 'SP_PRIMARY']));
+  body.appendChild(buildEvidenceSection('Direct SIFTS match', ev?.direct || [], ['CHAIN', 'SP_PRIMARY']));
   body.appendChild(buildEvidenceSection('MMseq homology hits', ev?.homology || [],
     ['hit_pdb_id', 'identity_percent', 'blast_identity_percent', 'alnlen']));
   document.getElementById('evidence-popup-backdrop').classList.add('on');
@@ -1369,87 +1186,63 @@ document.addEventListener('click', (e) => {
   }
 });
 
-/* ── mapped-proteins summary (top-left CF / top-right PDB) ──────────────
-   Only populated in "by mapping" color mode; cleared otherwise. */
+/* ── mapped-proteins summary ──────────────────────────────────────────── */
 function updateMappedSummaries() {
   const cfEl  = document.getElementById('cf-mapped-summary');
   const pdbEl = document.getElementById('pdb-mapped-summary');
   cfEl.innerHTML = ''; pdbEl.innerHTML = '';
 
   if (rightMode === 'input') {
-    /* In input mode the CF panel is in "pair highlight" mode; show which
-       proteins are highlighted rather than the full by-mapping breakdown. */
-    if (currentInputIdx >= 0) {
-      const m = (cur?.input_models || [])[currentInputIdx];
-      if (m) {
-        const unique = [...new Set(m.proteins)];
-        cfEl.innerHTML =
-          '<span class="m-blue">Highlighted: ' + unique.join(' \u2013 ') + '</span>';
-      }
+    const m = (cur?.input_models || [])[currentInputIdx];
+    if (m) {
+      const span = document.createElement('span');
+      span.className = 'm-blue';
+      span.textContent = 'Highlighted: ' + [...new Set(m.proteins)].join(' \u2013 ');
+      cfEl.appendChild(span);
     }
     return;
   }
-
   if (!cur || colorMode !== 'by-mapping') return;
 
   const pdbProts      = cur.pdb_proteins?.[currentPdbId] || [];
-  const chainEntries  = Object.entries(cur.cf_chain_map || {});
-  const knownProteins = [...new Set(chainEntries.map(([, u]) => u))];
-  const mappedProteins = knownProteins.filter(p => pdbProts.includes(p)).sort();
-  const novelProteins  = knownProteins.filter(p => !pdbProts.includes(p)).sort();
-
-  const allCfChains    = cur.cf_all_chains || Object.keys(cur.cf_chain_map || {});
-  const unmappedChains = allCfChains.filter(ch => !(ch in (cur.cf_chain_map || {}))).sort();
-
+  const modelProteins = [...new Set(Object.values(cur.cf_chain_map || {}))];
   renderGroup(cfEl, [
-    ['m-blue',   'Mapped',   mappedProteins],
-    ['m-off',    'Novel',    novelProteins],
-    ['m-purple', 'Unknown chains', unmappedChains],
+    ['m-blue', 'Mapped', modelProteins.filter(p => pdbProts.includes(p)).sort()],
+    ['m-off',  'Novel',  modelProteins.filter(p => !pdbProts.includes(p)).sort()],
   ]);
 
   const chainMap = cur.pdb_chain_map?.[currentPdbId] || {};
   const homMap   = cur.pdb_homology_map?.[currentPdbId] || {};
-  const homSet = new Set();
-  Object.values(chainMap).forEach(info => { if (info.cp) homSet.add(info.u); });
-  Object.values(homMap).forEach(arr => arr.forEach(p => homSet.add(p)));
+  const hitSet = new Set();
+  Object.values(chainMap).forEach(info => info.cp.forEach(p => hitSet.add(p)));
+  Object.values(homMap).forEach(arr => arr.forEach(p => hitSet.add(p)));
   const cpProteins = cur.cp_proteins || [];
   renderGroup(pdbEl, [
-    ['m-blue', 'Mapped', cpProteins.filter(p => homSet.has(p))],
-    ['m-off',  'No hit', cpProteins.filter(p => !homSet.has(p))],
+    ['m-blue', 'Mapped', cpProteins.filter(p => hitSet.has(p))],
+    ['m-off',  'No hit', cpProteins.filter(p => !hitSet.has(p))],
   ]);
 }
 
-/* ── annotations (Complex Portal, with RCSB-title fallback) ──────────────
-   CF panel: Complex Portal name for the whole complex, constant across
-   PDB switches.
-   PDB panel: Complex Portal per-PDB annotation if present; otherwise the
-   RCSB entry title fetched alongside the structure (labeled as such, since
-   it's a different source with different curation than Complex Portal). */
+/* ── annotations: Complex Portal; RCSB title (labelled) where CP has none ─ */
 function updateAnnotations() {
   const cfEl  = document.getElementById('cf-annotation');
   const pdbEl = document.getElementById('pdb-annotation');
-  cfEl.textContent = cur?.cp_annotation ? cur.cp_annotation : '(no Complex Portal annotation)';
+  cfEl.textContent = cur?.cp_annotation || '(no Complex Portal annotation)';
 
   if (rightMode === 'input') {
     const m = (cur?.input_models || [])[currentInputIdx];
-    pdbEl.textContent = m
-      ? 'Input pair: ' + m.label + '  [' + m.filename + ']'
-      : '(no input pair selected)';
+    pdbEl.textContent = m ? 'Input pair: ' + m.label + '  [' + m.filename + ']'
+                          : '(no input pair models)';
     return;
   }
-
+  if (!currentPdbId) { pdbEl.textContent = ''; return; }
   const cpAnnot   = cur?.pdb_annotation?.[currentPdbId];
   const rcsbTitle = pdbCache[currentPdbId]?.title;
-  if (cpAnnot) {
-    pdbEl.textContent = cpAnnot;
-  } else if (rcsbTitle) {
-    pdbEl.textContent = rcsbTitle;
-  } else {
-    pdbEl.textContent = '(no annotation available)';
-  }
+  if (cpAnnot)        pdbEl.textContent = cpAnnot;
+  else if (rcsbTitle) pdbEl.textContent = 'RCSB title: ' + rcsbTitle;
+  else                pdbEl.textContent = '(no annotation available)';
 }
 
-/* ── overlay helper ───────────────────────────────────────────────────── */
 function spin(id, on, msg) {
   const el = document.getElementById(id);
   el.classList.toggle('on', on);
@@ -1460,35 +1253,33 @@ function spin(id, on, msg) {
 async function loadCF(idx) {
   if (!cur) return;
   const models = cur.cf_models;
-  if (!models || models.length === 0) {
+  if (!models.length) {
+    cfRaw = null;
     cfV.removeAllModels(); cfV.render();
-    document.getElementById('model-info').textContent = 'No models';
+    document.getElementById('model-info').textContent = 'No CombFold model';
     document.getElementById('prev-m').disabled = true;
     document.getElementById('next-m').disabled = true;
     return;
   }
-  idx = Math.max(0, Math.min(idx, models.length-1));
+  idx = Math.max(0, Math.min(idx, models.length - 1));
   mIdx = idx;
+  const complexAtStart = cur;
   spin('cf-overlay', true, 'Loading...');
   try {
     const pdb = await ungzip(models[idx].pdb_gz);
-    cur.cf_all_chains = [...new Set(
-      pdb.split('\n')
-        .filter(l => l.startsWith('ATOM') && l.length > 21)
-        .map(l => l[21])
-    )];
+    if (cur !== complexAtStart) return;  // user switched complex meanwhile
     styleViewer(cfV, pdb, 'pdb', 'cf');
     document.getElementById('model-info').textContent =
-      (idx+1) + ' / ' + models.length + '  CF ' + models[idx].score.toFixed(1);
-  } catch(e) {
+      (idx + 1) + ' / ' + models.length + '  CF ' + models[idx].score.toFixed(1);
+  } catch (e) {
     console.error(e);
     document.getElementById('model-info').textContent = 'Load error';
   } finally { spin('cf-overlay', false); }
   document.getElementById('prev-m').disabled = idx <= 0;
-  document.getElementById('next-m').disabled = idx >= models.length-1;
+  document.getElementById('next-m').disabled = idx >= models.length - 1;
 }
 
-/* ── RCSB fetches: structure + entry title (used as annotation fallback) ─ */
+/* ── RCSB: structure (.pdb, or .cif for entries without legacy PDB format) + title ── */
 async function fetchPDBTitle(pid) {
   try {
     const r = await fetch('https://data.rcsb.org/rest/v1/core/entry/' + pid.toUpperCase());
@@ -1513,43 +1304,38 @@ async function fetchPDBText(pid) {
   return { ...struct, title };
 }
 
-/* ── load PDB reference (cache-first) ─────────────────────────────────── */
 async function loadPDB(pid) {
   if (!pid) return;
   currentPdbId = pid;
   document.querySelectorAll('.pdb-btn')
     .forEach(b => b.classList.toggle('active', b.dataset.pid === pid));
-  updateAnnotations(); // shows whatever's cached so far (instant on cache hit)
-
+  updateAnnotations();
   const owner = pdbCacheOwner;
 
   if (pdbCache[pid]) {
-    const { text, fmt } = pdbCache[pid];
+    spin('pdb-overlay', false);
+    const {text, fmt} = pdbCache[pid];
     styleViewer(pdbV, text, fmt, 'pdb');
     if (cfRaw) styleViewer(cfV, cfRaw, 'pdb', 'cf');
     return;
   }
-
   spin('pdb-overlay', true, 'Fetching from RCSB...');
   try {
     const result = await fetchPDBText(pid);
-    if (owner === pdbCacheOwner) pdbCache[pid] = result; // still same complex
-    if (currentPdbId !== pid) return; // user switched to a different PDB meanwhile
+    if (owner !== pdbCacheOwner) return;      // complex changed meanwhile
+    pdbCache[pid] = result;
+    if (currentPdbId !== pid || rightMode !== 'pdb') return;
     styleViewer(pdbV, result.text, result.fmt, 'pdb');
     if (cfRaw) styleViewer(cfV, cfRaw, 'pdb', 'cf');
-    updateAnnotations(); // title (if any) has now arrived
+    updateAnnotations();
     spin('pdb-overlay', false);
-  } catch(e) {
+  } catch (e) {
     console.error(e);
     spin('pdb-overlay', true, 'Could not load ' + pid.toUpperCase() + ' - ' + e.message);
-    setTimeout(() => spin('pdb-overlay', false), 3000);
   }
 }
 
-/* ── background prefetch of the remaining reference PDBs ─────────────────
-   Fetches sequentially (gentle on RCSB) and bails out immediately if the
-   user has since switched to a different complex, so a slow prefetch
-   never contaminates a new complex's cache. */
+/* Sequential, stops as soon as the user switches complex. */
 async function prefetchOtherPDBs(owner, pids) {
   for (const pid of pids) {
     if (owner !== pdbCacheOwner) return;
@@ -1560,7 +1346,7 @@ async function prefetchOtherPDBs(owner, pids) {
       pdbCache[pid] = result;
       const btn = document.querySelector('.pdb-btn[data-pid="' + pid + '"]');
       if (btn) btn.classList.add('cached');
-      if (currentPdbId === pid) updateAnnotations(); // in case title arrived after view
+      if (currentPdbId === pid) updateAnnotations();
     } catch (e) {
       console.error('prefetch failed for', pid, e);
     }
@@ -1568,54 +1354,62 @@ async function prefetchOtherPDBs(owner, pids) {
 }
 
 /* ── select complex ───────────────────────────────────────────────────── */
+function setWarning(id, text) {
+  const el = document.getElementById(id);
+  el.textContent = text || '';
+  el.title       = text || '';
+  el.classList.toggle('on', !!text);
+}
+
 function selectComplex(ac) {
   cur = COMPLEXES[ac];
   if (!cur) return;
 
-  /* reset right-panel mode every time we switch complexes */
-  rightMode       = 'pdb';
+  cfRaw = null; pdbRaw = null;
+  currentPdbId = null;
   currentInputIdx = -1;
-  inputRaw        = null;
-  inputChainMap   = {};
-  document.getElementById('tab-pdb').classList.add('active');
-  document.getElementById('tab-input').classList.remove('active');
-  document.getElementById('pdb-list').style.display    = '';
-  document.getElementById('input-list').style.display  = 'none';
-  document.getElementById('pdb-cap-warning').style.display = '';
-  /* enable/disable Input Pairs tab based on availability */
-  const hasInputs = (cur.input_models || []).length > 0;
-  document.getElementById('tab-input').disabled = !hasInputs;
-  document.getElementById('tab-input').title    =
-    hasInputs ? '' : 'No input models embedded for this complex';
-
-  pdbCache      = {};   // drop previous complex's cache
+  inputChainMap = {};
+  pdbCache = {};
   pdbCacheOwner = ac;
+  spin('pdb-overlay', false);
+
+  const hasInputs = cur.input_models.length > 0;
+  document.getElementById('tab-input').disabled = !hasInputs;
+  document.getElementById('tab-input').title = hasInputs ? '' : 'No CombFold run -> no input models';
 
   document.getElementById('badge-cf').textContent =
-    'CF ' + cur.cf_confidence.toFixed(1);
-  document.getElementById('badge-match').textContent =
-    cur.match_class.replace(/_/g,' ');
-  const sl = document.getElementById('stoic-label');
-  sl.textContent = cur.stoic_label;
-  sl.title = cur.stoic_label;
+    (cur.cf_confidence != null ? 'CF ' + cur.cf_confidence.toFixed(1) : 'CF \u2013')
+    + '  (untrimmed ' + cur.cf_confidence_ref.toFixed(1) + ')';
+  document.getElementById('badge-match').textContent = cur.match_class.replace(/_/g, ' ');
 
-  const cfModel0 = (cur.cf_models && cur.cf_models[0]) || null;
+  const stoicText = cur.stoic_label
+    ? cur.stoic_label + '  [' + cur.run_labels.join('/') + ']'
+    : '(no CombFold run)';
+  const sl = document.getElementById('stoic-label');
+  sl.textContent = stoicText;
+  sl.title = stoicText;
+
+  const missing = Object.entries(cur.assembly_missing);
+  setWarning('assembly-warning', missing.length
+    ? 'partial assembly, missing: ' + missing.map(([p, n]) => p + ' x' + n).join(', ')
+    : '');
+
+  const cfModel0 = cur.cf_models[0] || null;
   const cfPathEl = document.getElementById('cf-path');
-  cfPathEl.textContent = cfModel0 ? cfModel0.folder : '(no CF model found)';
+  cfPathEl.textContent = cfModel0 ? cfModel0.folder : '(no CombFold model)';
   cfPathEl.title       = cfModel0 ? cfModel0.path   : '';
 
-  const capEl = document.getElementById('pdb-cap-warning');
-  if (cur.pdb_cap_hit) {
-    capEl.textContent = 'capped at ' + (cur.pdb_ids?.length ?? 0) + ' PDBs';
-    capEl.classList.add('on');
-  } else {
-    capEl.classList.remove('on');
-  }
+  document.getElementById('pdb-cover-level').textContent =
+    cur.pdb_cover_level ? 'cover ' + cur.pdb_cover_level + '%' : '';
+  setWarning('pdb-cap-warning', cur.pdb_cap_hit
+    ? 'showing ' + cur.pdb_ids.length + ' of ' + cur.pdb_n_total + ' PDBs' : '');
+  setWarning('input-cap-warning', cur.input_cap_hit
+    ? 'showing ' + cur.input_models.length + ' of ' + cur.input_n_total + ' pair models (rank 1 first)' : '');
 
   const list = document.getElementById('pdb-list');
   list.innerHTML = '';
-  const pids = cur.pdb_ids || [];
-  if (pids.length === 0) {
+  const pids = cur.pdb_ids;
+  if (!pids.length) {
     list.textContent = 'no PDB';
   } else {
     pids.forEach(pid => {
@@ -1628,49 +1422,42 @@ function selectComplex(ac) {
     });
   }
 
+  setRightMode('pdb');
   mIdx = 0;
-  updateAnnotations();
   loadCF(0);
   if (pids.length) {
     loadPDB(pids[0]);
     prefetchOtherPDBs(ac, pids.slice(1));
-  } else {
-    currentPdbId = null; pdbV.removeAllModels(); pdbV.render();
-    updateMappedSummaries(); updateAnnotations();
   }
+  updateAnnotations();
+  updateMappedSummaries();
 }
 
-/* ── dropdown ─────────────────────────────────────────────────────────── */
+/* ── dropdown (order = Python order: trimmed CF score, best first) ─────── */
 function buildDropdown() {
   const sel = document.getElementById('complex-select');
   Object.values(COMPLEXES).forEach(c => {
     const opt = document.createElement('option');
     opt.value = c.complex_ac;
-    const id  = c.identifiers.length > 55
-                ? c.identifiers.slice(0,52)+'...'
-                : c.identifiers;
-    opt.textContent = c.complex_ac + '  -  ' + id;
+    const ids = c.identifiers.length > 55 ? c.identifiers.slice(0, 52) + '...' : c.identifiers;
+    opt.textContent = c.complex_ac + '  -  ' + ids;
     sel.appendChild(opt);
   });
   sel.onchange = () => selectComplex(sel.value);
 }
 
 /* ── event wiring ─────────────────────────────────────────────────────── */
-document.getElementById('prev-m').onclick = () => loadCF(mIdx-1);
-document.getElementById('next-m').onclick = () => loadCF(mIdx+1);
+document.getElementById('prev-m').onclick = () => loadCF(mIdx - 1);
+document.getElementById('next-m').onclick = () => loadCF(mIdx + 1);
 
 document.getElementById('scr-page').onclick = function() {
   const btn = this;
   btn.classList.add('busy');
   btn.textContent = '...';
   html2canvas(document.documentElement, {
-    useCORS: true,
-    allowTaint: true,
-    scale: 3,
-    width:        window.innerWidth,
-    height:       window.innerHeight,
-    windowWidth:  window.innerWidth,
-    windowHeight: window.innerHeight,
+    useCORS: true, allowTaint: true, scale: 3,
+    width: window.innerWidth, height: window.innerHeight,
+    windowWidth: window.innerWidth, windowHeight: window.innerHeight,
     ignoreElements: el => el === btn,
   }).then(canvas => {
     const a = document.createElement('a');
@@ -1685,14 +1472,8 @@ document.getElementById('scr-page').onclick = function() {
 
 document.getElementById('color-mode').onchange = function() {
   colorMode = this.value;
-  document.getElementById('plddt-legend').style.display =
-    colorMode === 'plddt' ? '' : 'none';
+  document.getElementById('plddt-legend').style.display = colorMode === 'plddt' ? '' : 'none';
   if (rightMode === 'input') {
-    /* In input mode the right panel is showing an input pair (already
-       colorable by pLDDT via loadInputModel/styleInputViewer below), and
-       the CF viewer is in pair-highlight mode which never follows the
-       color dropdown. Re-render just the input pair so a switch to/from
-       'plddt' takes effect immediately. */
     if (currentInputIdx >= 0) loadInputModel(currentInputIdx);
     return;
   }
@@ -1700,39 +1481,22 @@ document.getElementById('color-mode').onchange = function() {
   if (pdbRaw) styleViewer(pdbV, pdbRaw, pdbFmtCur, 'pdb');
 };
 
-/* Re-render whatever pLDDT-filterable panel(s) are currently visible,
-   after either the cutoff value or the filter mode changes. Reference
-   PDB (crystal) panel intentionally NOT refiltered -- see applyPlddtFilter
-   note; it never carries pLDDT data in the first place. */
 function refilterAfterPlddtChange() {
-  if (rightMode === 'input') {
-    if (currentInputIdx >= 0) loadInputModel(currentInputIdx); // re-decompress + refilter
-    else if (cfRaw) styleViewer(cfV, cfRaw, 'pdb', 'cf');
-  } else {
-    if (cfRaw) styleViewer(cfV, cfRaw, 'pdb', 'cf');
-  }
+  if (rightMode === 'input' && currentInputIdx >= 0) loadInputModel(currentInputIdx);
+  else if (cfRaw) styleViewer(cfV, cfRaw, 'pdb', 'cf');
 }
 
-/* Slider and number box are two views onto the same plddtThreshold value
-   -- keep them in sync so the user can drag OR type, whichever's handy. */
 function setThresholdValue(raw) {
   plddtThreshold = Math.max(0, Math.min(100, Number(raw) || 0));
   document.getElementById('plddt-threshold').value     = plddtThreshold;
   document.getElementById('plddt-threshold-num').value = plddtThreshold;
 }
-
 document.getElementById('plddt-threshold').oninput = function() {
-  setThresholdValue(this.value);
-  refilterAfterPlddtChange();
+  setThresholdValue(this.value); refilterAfterPlddtChange();
 };
 document.getElementById('plddt-threshold-num').oninput = function() {
-  setThresholdValue(this.value);
-  refilterAfterPlddtChange();
+  setThresholdValue(this.value); refilterAfterPlddtChange();
 };
-
-/* Fixed-threshold vs. top-50%-per-chain mode toggle. The slider/number
-   box are only meaningful in 'threshold' mode, so disable (not hide --
-   keeps the layout stable) whichever control isn't active. */
 document.querySelectorAll('input[name="plddt-mode"]').forEach(radio => {
   radio.onchange = function() {
     plddtMode = this.value;
@@ -1746,10 +1510,10 @@ document.querySelectorAll('input[name="plddt-mode"]').forEach(radio => {
 /* ── init ─────────────────────────────────────────────────────────────── */
 initViewers();
 buildDropdown();
-const first = Object.keys(COMPLEXES)[0];
-if (first) {
-  document.getElementById('complex-select').value = first;
-  selectComplex(first);
+const firstComplex = Object.keys(COMPLEXES)[0];
+if (firstComplex) {
+  document.getElementById('complex-select').value = firstComplex;
+  selectComplex(firstComplex);
 }
 </script>
 </body>
@@ -1758,12 +1522,12 @@ if (first) {
 
 # ── write output ──────────────────────────────────────────────────────────────
 
-json_blob = json.dumps(EMBED, ensure_ascii=True)
-html_out  = HTML.replace("%%JSON%%", json_blob)
+json_blob = json.dumps(complex_entries, ensure_ascii=True, default=str)
+assert "%%JSON%%" in HTML
+html_out = HTML.replace("%%JSON%%", json_blob)
 
 OUT.parent.mkdir(parents=True, exist_ok=True)
 OUT.write_text(html_out, encoding="utf-8")
-
 size_kb = OUT.stat().st_size / 1024
 print(f"\n  Written: {OUT}")
-print(f"   Size:    {size_kb:.0f} KB  (~{size_kb/1024:.1f} MB)")
+print(f"   Size:    {size_kb:.0f} KB  (~{size_kb / 1024:.1f} MB)")

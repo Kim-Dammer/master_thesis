@@ -12,10 +12,18 @@ for each query protein x PDB hit pair:
  - high_homology_blast_filtered    : high_homology_blast AND alnlen >= min-aln-len
                                       (guards against short, coincidental high-identity matches)
 
+for CP
 uv run 3_compute_mmseqs_similarity.py \
   --input /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/mmseqs_results.parquet \
-  --output /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_new_identity_similarity_max_sensitivity.parquet \
-  --summary /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_new_per_protein_summary_max_sensitivity.parquet
+  --output /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_identity_similarity_max_sensitivity.parquet \
+  --summary /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/mmseqs_run_max_sensitivity/results/mmseqs_per_protein_summary_max_sensitivity.parquet
+
+For YM
+uv run 3_compute_mmseqs_similarity.py \
+  --input /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/YM_CP_combined/mmseqs_results.parquet \
+  --output /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/YM_CP_combined/results/YM_CP_combined_mmseqs_max_sensitivity.parquet \
+  --summary /cluster/project/beltrao/kdammer/master_thesis/scripts/mmseq_homology_match/mmseqs/YM_CP_combined/results/YM_CP_combined_mmseqs_summary_max_sensitivity.parquet
+
 """
 
 import argparse
