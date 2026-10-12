@@ -23,6 +23,7 @@ scripts/Pipeline/create_interactive_html/*.parquet
 scripts/Pipeline/create_interactive_html/*.html
 scripts/Pipeline/select_best_metric_for_input_models/*.csv
 
+notebooks/ccprofiler_files/** 
 
 scripts/mmseq_homology_match/mmseqs
 scripts/mmseq_homology_match/all_queries.fasta
