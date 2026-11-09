@@ -4,6 +4,7 @@ Trimmed YeastMap CombFold viewer, compared to the untrimmed run or to the CP cor
 
 Dropdown : YeastMap complexes whose best trimmed output (over pred_1/2/3) has confidence > CONF_THRESHOLD,
            filterable by PDB match class (all_YM_pdb_matches.csv)
+           + search box: words must all match (ids, CPX, UniProt, PDB, gene names); numbers match whole numbers (523 -> pred_CPX_523)
 Left     : trimmed run, best output per predicted stoichiometry, arrows step through the
            stoichiometries from highest to lowest confidence
 Right    : switch between
@@ -26,10 +27,14 @@ GO       : button opens a panel with
            - per protein: how many of its GO terms are shared with the other side (added <-> CP core)
            - term x protein matrix (BP / MF / CC), rows: shared, added only, core only
            - click a term -> its proteins are highlighted in both 3D panels
+Evidence : from 10_cf_candidate_evidence.py (best trimmed stoichiometry): TM-score CF core model vs core PDB and
+           trimmed-model core chains vs core PDB, per added protein IPI interactions with CP core proteins (PMIDs) and
+           the most specific GO term shared with the core; badges in the top bar, column in the GO panel, sortable
 Gene names are fetched from the UniProt REST API when the page is opened (ids only if offline).
 """
 import base64
 import gzip
+from collections import defaultdict
 import hashlib
 import json
 import re
@@ -49,8 +54,9 @@ PDB_MATCHES_CSV = DATA / "YM_CP_complete_complex_pdb_mapping/all_YM_pdb_matches.
 GO_PARQUET = DATA / "GO/ym_protein_mapping.parquet"
 CORE_PDB_MATCHES_CSV = DATA / "complete_complex_pdb_mapping_v2/all_pdb_matches_with_match_class.csv"   # CP complex -> PDB
 CORE_PDB_CHAIN_HITS_CSV = DATA / "complete_complex_pdb_mapping_v2/homology_pdb_mapping/exact_matches.csv"   # CP protein -> PDB chain
+EVIDENCE_DIR = DATA / "Pipeline/viewer/10_cf_candidate_evidence"   # written by 10_cf_candidate_evidence.py (run it first)
 CONF_THRESHOLD = 75
-OUT = DATA / "Pipeline/viewer/09_trimmed_vs_untrimmed_viewer_cf_75.html"
+OUT = DATA / "Pipeline/viewer/09_trimmed_vs_untrimmed_viewer_cf_75_TM.html"
 BACKBONE_ATOMS = {"N", "CA", "C", "O"}   # enough for a cartoon, ~5x smaller than full atom
 N_THREADS = 16                           # file reads are the slow part -> read complexes in parallel
 
@@ -68,7 +74,8 @@ def results_csv(run: str) -> Path:
 
 
 for required_path in (results_csv(TRIMMED_RUN), results_csv(CP_RUN), YEASTMAP_TSV, PDB_MATCHES_CSV, GO_PARQUET,
-                      CORE_PDB_MATCHES_CSV, CORE_PDB_CHAIN_HITS_CSV, DATA / "Pipeline" / UNTRIMMED_RUN / "CombFold"):
+                      CORE_PDB_MATCHES_CSV, CORE_PDB_CHAIN_HITS_CSV, DATA / "Pipeline" / UNTRIMMED_RUN / "CombFold",
+                      EVIDENCE_DIR / "candidate_evidence.csv", EVIDENCE_DIR / "added_protein_evidence.csv"):
     assert required_path.exists(), f"missing: {required_path}"
 
 
@@ -226,6 +233,24 @@ def core_pdb_reference(cp_ac: str, core_proteins: set[str]) -> dict | None:
             "chain_to_protein": chain_to_protein}
 
 
+def evidence_for_complex(ym_ac: str, best_trimmed_folder: str, added_proteins: set[str]) -> dict:
+    """10_cf_candidate_evidence.py rows of one complex; checked to describe the same stoichiometry / added proteins"""
+    evidence_row = candidate_evidence_by_ym_ac[ym_ac]
+    assert evidence_row["stoichiometry"] + "_pool_output" == best_trimmed_folder, \
+        f"{ym_ac}: evidence scored {evidence_row['stoichiometry']}, viewer's best stoi is {best_trimmed_folder}"
+    added_rows = added_evidence_rows_by_ym_ac[ym_ac]
+    assert {row["added_protein"] for row in added_rows} == added_proteins, f"{ym_ac}: added proteins differ from the evidence csv"
+    tm_columns = [f"{prefix}_{suffix}" for prefix in ("core_model_vs_pdb", "trimmed_core_vs_pdb")
+                  for suffix in ("tm", "tm_norm_by_pdb", "rmsd", "n_residues_cf", "n_residues_pdb", "n_residues_aligned")]
+    count_columns = ["n_added_with_ipi", "n_added_go_bp_support", "n_added_go_cc_support", "n_added_go_mf_support"]
+    split_list = lambda text: text.split(";") if text else []
+    return {column: evidence_row[column] for column in tm_columns + count_columns} | {"added": {
+        row["added_protein"]: {"ipi_partners": split_list(row["ipi_core_partners"]), "pmids": split_list(row["ipi_pmids"])}
+                              | {aspect: [row[f"go_{aspect}_term"], row[f"go_{aspect}_name"], row[f"go_{aspect}_freq"]]
+                                 if row[f"go_{aspect}_term"] else None for aspect in ("BP", "CC", "MF")}
+        for row in added_rows}}
+
+
 def go_terms_for_complex(ym_ac: str, core_kept: set[str], core_dropped: set[str], added: set[str]) -> list[list]:
     """GO rows of one YM complex -> [[go_id, 'BP', name, dataset_freq, [proteins]], ...] (root terms dropped).
 
@@ -339,6 +364,17 @@ assert not missing_pdb_match, f"{len(missing_pdb_match)} complexes not in {PDB_M
 missing_core_pdb_match = sorted({cp_ac_by_ym_ac[ac] for ac in confident_complexes["complex_ac"]} - core_pdb_match_by_cp_ac.keys())
 assert not missing_core_pdb_match, \
     f"{len(missing_core_pdb_match)} CP core complexes not in {CORE_PDB_MATCHES_CSV.name}: {missing_core_pdb_match[:10]}"
+candidate_evidence = pl.read_csv(EVIDENCE_DIR / "candidate_evidence.csv", infer_schema_length=None)
+assert candidate_evidence["complex_ac"].is_unique().all(), "candidate_evidence.csv: more than one row per complex"
+candidate_evidence_by_ym_ac = {evidence_row["complex_ac"]: evidence_row for evidence_row in candidate_evidence.iter_rows(named=True)}
+added_protein_evidence = pl.read_csv(EVIDENCE_DIR / "added_protein_evidence.csv", infer_schema_length=None,
+                                     schema_overrides={"ipi_core_partners": pl.String, "ipi_pmids": pl.String})
+assert added_protein_evidence.select("complex_ac", "added_protein").is_unique().all(), "added_protein_evidence.csv: duplicate rows"
+added_evidence_rows_by_ym_ac = defaultdict(list)
+for added_row in added_protein_evidence.iter_rows(named=True):
+    added_evidence_rows_by_ym_ac[added_row["complex_ac"]].append(added_row)
+missing_evidence = [ac for ac in confident_complexes["complex_ac"] if ac not in candidate_evidence_by_ym_ac]
+assert not missing_evidence, f"{len(missing_evidence)} complexes not in candidate_evidence.csv (rerun 10_cf_candidate_evidence.py): {missing_evidence[:10]}"
 missing_go = [ac for ac in confident_complexes["complex_ac"] if ac not in go_rows_by_ym_ac]
 assert not missing_go, f"{len(missing_go)} complexes not in {GO_PARQUET.name}: {missing_go[:10]}"
 print(f"{confident_complexes.height}/{trimmed_results.height} complexes with trimmed conf > {CONF_THRESHOLD}")
@@ -399,6 +435,7 @@ def build_complex_entry(row: dict) -> dict:
         "core_pdb": core_pdb_reference(cp_row["complex_ac"], core_proteins),
         "protein_groups": protein_groups,
         "go_terms": go_terms_for_complex(row["complex_ac"], *(set(protein_groups[g]) for g in ("core_kept", "core_dropped", "added"))),
+        "evidence": evidence_for_complex(row["complex_ac"], stois[0]["trimmed"]["folder"], set(protein_groups["added"])),
     }
 
 
@@ -462,6 +499,10 @@ button { cursor:pointer; }
 .pdb-exact_pdb_match { background:#0b4d24; color:#fff; }
 .pdb-exact_homology_match { background:#1e7b3c; color:#fff; }
 .badge.warn { background:#d62728; color:#fff; }
+.badge.tm-good { background:#1e7b3c; color:#fff; } .badge.tm-mid { background:#f2c94c; color:#4d3800; }
+.badge.tm-bad { background:#e5958f; color:#5c120d; } .badge.ev-yes { background:#5e3c99; color:#fff; }
+.evidence-cell { font-size:11px; line-height:1.5; max-width:260px; }
+.evidence-cell .pmid { font-family:ui-monospace,Menlo,monospace; font-size:10px; margin-right:4px; }
 #color-legend { font-size:11px; color:var(--muted); }
 #color-legend .sw { width:10px; height:10px; }
 .pdb-superset { background:#9ccc65; color:#20380a; }
@@ -488,7 +529,7 @@ body.go-open .go-panel { display:flex; }
 .go-hdr { padding:7px 12px; border-bottom:1px solid #e6e9ed; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
 .go-hdr h3 { font-size:13px; }
 .go-hdr .spacer { flex:1; }
-.go-body { flex:1; min-height:0; display:grid; grid-template-columns:minmax(300px, 400px) 1fr; }
+.go-body { flex:1; min-height:0; display:grid; grid-template-columns:minmax(380px, 560px) 1fr; }
 .go-summary, .go-matrix { overflow:auto; min-height:0; }
 .go-summary { border-right:1px solid #e6e9ed; padding:6px 10px; }
 .go-summary p { color:var(--muted); font-size:11px; margin:2px 0 6px; }
@@ -528,10 +569,19 @@ td.cell i { display:block; width:12px; height:12px; margin:auto; border-radius:2
 <div class="topbar">
   <select id="pdb-filter" title="filter complexes by PDB match class of the YeastMap complex"></select>
   <select id="core-pdb-filter" title="filter complexes by PDB match class of their CP core complex"></select>
+  <input type="search" id="complex-search" placeholder="search: 523, cpx 1332, RAT1, 8q6v" style="width:190px"
+         title="all words must match; numbers match whole numbers only">
   <button id="prev-complex">&#9664;</button>
   <select id="complex-select"></select>
   <button id="next-complex">&#9654;</button>
   <span id="pdb-info"></span>
+  <span id="evidence-info"></span>
+  <label>Sort <select id="sort-by" title="order of the complex list">
+    <option value="conf">CF confidence</option>
+    <option value="tm_trimmed">trimmed core &harr; PDB TM</option>
+    <option value="tm_core">CF core &harr; PDB TM</option>
+    <option value="evidence">added proteins with IPI / specific GO BP</option>
+  </select></label>
   <label>Color <select id="color-mode">
     <option value="chain">by chain</option>
     <option value="protein">by protein</option>
@@ -1090,11 +1140,14 @@ function renderGo() {
     return `<td><span class="frac">${shared}/${total}</span><span class="bar"><i style="width:${100 * shared / total}%"></i></span></td>`;
   };
   const roleRows = (proteins, role) => proteins.map(p =>
-    `<tr><td>${protLabel(p)}<div class="role">${role}</div></td>${Object.keys(ASPECTS).map(a => fracCell(p, a)).join('')}</tr>`).join('');
+    `<tr><td>${protLabel(p)}<div class="role">${role}</div></td>${Object.keys(ASPECTS).map(a => fracCell(p, a)).join('')}`
+    + `${evidenceCell(p)}</tr>`).join('');
   $('go-summary').innerHTML =
     `<p>Terms of each protein that also occur on the other side: added proteins vs all CP core proteins, `
     + `CP core proteins vs added proteins. Respects the frequency cutoff.</p>`
-    + `<table><thead><tr><th>protein</th>${Object.keys(ASPECTS).map(a => `<th>${a}</th>`).join('')}</tr></thead><tbody>`
+    + `<p>evidence (added proteins): IPI annotations with CP core proteins (GOA, PMIDs) and the most specific GO term shared `
+    + `with the core after propagation (% of annotated yeast proteins carrying it).</p>`
+    + `<table><thead><tr><th>protein</th>${Object.keys(ASPECTS).map(a => `<th>${a}</th>`).join('')}<th>evidence</th></tr></thead><tbody>`
     + roleRows(groups.added, 'added by YeastMap') + roleRows(groups.core_kept, 'CP core, in YM')
     + roleRows(groups.core_dropped, 'CP core, not in YM') + '</tbody></table>';
 
@@ -1182,6 +1235,7 @@ function selectComplex(index) {
   $('prev-complex').disabled = position <= 0;
   $('next-complex').disabled = position === visibleComplexes.length - 1;
   $('pdb-info').innerHTML = pdbBadge(complex);
+  $('evidence-info').innerHTML = evidenceBadges(complex);
   highlight = null;
   $('highlight-chip').classList.remove('on');
   renderGo();
@@ -1189,23 +1243,77 @@ function selectComplex(index) {
   fetchGeneNames(proteinOrder(complex));
 }
 
+/* ── evidence (10_cf_candidate_evidence.py, best trimmed stoichiometry) ── */
+function tmClass(tm) { return tm >= 0.8 ? 'tm-good' : tm >= 0.5 ? 'tm-mid' : 'tm-bad'; }
+function evidenceBadges(c) {
+  const ev = c.evidence, nAdded = c.protein_groups.added.length;
+  const tmBadge = (label, prefix, tooltip) => ev[prefix + '_tm'] === null ? ''
+    : `<span class="badge ${tmClass(ev[prefix + '_tm'])}" title="${tooltip}; TM normalised by CF ${ev[prefix + '_tm'].toFixed(3)}, `
+      + `by PDB ${ev[prefix + '_tm_norm_by_pdb'].toFixed(3)}, RMSD ${ev[prefix + '_rmsd'].toFixed(2)} A, `
+      + `${ev[prefix + '_n_residues_aligned']}/${ev[prefix + '_n_residues_cf']} CF residues aligned">${label} ${ev[prefix + '_tm'].toFixed(2)}</span> `;
+  return tmBadge('CF core↔PDB TM', 'core_model_vs_pdb', 'best CombFold model of the CP core vs the core PDB (mapped chains)')
+    + tmBadge('trimmed core↔PDB TM', 'trimmed_core_vs_pdb', 'CP core chains of the best trimmed model vs the core PDB (mapped chains)')
+    + badge(`IPI ${ev.n_added_with_ipi}/${nAdded} added`, ev.n_added_with_ipi ? 'ev-yes' : '')
+    + badge(`specific GO BP ${ev.n_added_go_bp_support}/${nAdded}`, ev.n_added_go_bp_support ? 'ev-yes' : '');
+}
+function evidenceCell(protein) {
+  const added = complex.evidence.added[protein];
+  if (!added) return '<td></td>';
+  const ipi = added.ipi_partners.length
+    ? 'IPI with ' + added.ipi_partners.map(p => protLabel(p, false)).join(', ') + '<br>'
+      + added.pmids.map(pmid => `<a class="pmid" href="https://pubmed.ncbi.nlm.nih.gov/${pmid.replace('PMID:', '')}/" target="_blank" rel="noopener">${pmid}</a>`).join('')
+    : '<span class="role">no IPI with core</span>';
+  const goLine = aspect => added[aspect]
+    ? `<br>${aspect}: <a href="https://www.ebi.ac.uk/QuickGO/term/${added[aspect][0]}" target="_blank" rel="noopener">${esc(added[aspect][1])}</a> `
+      + `<span class="role">(${(100 * added[aspect][2]).toFixed(1)}%)</span>` : '';
+  return `<td class="evidence-cell">${ipi}${goLine('BP')}${goLine('CC')}</td>`;
+}
+function sortValue(c) {
+  const mode = $('sort-by').value, ev = c.evidence;
+  if (mode === 'tm_trimmed') return ev.trimmed_core_vs_pdb_tm;
+  if (mode === 'tm_core') return ev.core_model_vs_pdb_tm;
+  if (mode === 'evidence') return ev.n_added_with_ipi + ev.n_added_go_bp_support;
+  return c.stois[0].trimmed.conf;
+}
+
 function optionText(c) {
   const ids = c.identifiers.length > 50 ? c.identifiers.slice(0, 47) + '...' : c.identifiers;
   const pdb = c.pdb_match.pdb_id ? ' ' + c.pdb_match.pdb_id.toUpperCase() : '';
   const corePdb = c.core_pdb_match.pdb_id ? ' ' + c.core_pdb_match.pdb_id.toUpperCase() : '';
-  return `${c.complex_ac}  (CF ${c.stois[0].trimmed.conf.toFixed(1)}, PDB ${PDB_CLASS_NAMES[c.pdb_match.match_class]}${pdb}, `
+  const tm = c.evidence.trimmed_core_vs_pdb_tm === null ? '' : `, core TM ${c.evidence.trimmed_core_vs_pdb_tm.toFixed(2)}`;
+  return `${c.complex_ac}  (CF ${c.stois[0].trimmed.conf.toFixed(1)}${tm}, PDB ${PDB_CLASS_NAMES[c.pdb_match.match_class]}${pdb}, `
        + `core ${c.cp_complex_ac} PDB ${PDB_CLASS_NAMES[c.core_pdb_match.match_class]}${corePdb})  ${ids}`;
+}
+
+/* ── complex search: every word must match; numbers only as whole numbers (523 != 1523) ── */
+const normalizeSearch = text => ' ' + String(text).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim() + ' ';
+function complexSearchText(c) {
+  const proteins = [...c.core_proteins, ...c.protein_groups.added];
+  return normalizeSearch([c.complex_ac, c.cp_complex_ac, c.identifiers, ...proteins,
+                          ...proteins.map(p => geneNames.get(p) || ''),
+                          c.pdb_match.pdb_id || '', c.core_pdb_match.pdb_id || ''].join(' '));
+}
+function matchesSearch(c, queryWords) {
+  if (!queryWords.length) return true;
+  const searchText = complexSearchText(c);
+  return queryWords.every(word => /^\\d+$/.test(word)
+    ? new RegExp(`(^|[^0-9])${word}([^0-9]|$)`).test(searchText)   // whole number: 523 matches CPX_523, not 1523 / P05232
+    : searchText.includes(word));
 }
 
 function rebuildComplexOptions() {
   const pdbClass = $('pdb-filter').value, corePdbClass = $('core-pdb-filter').value;
+  const queryWords = normalizeSearch($('complex-search').value).trim().split(' ').filter(Boolean);
   visibleComplexes = COMPLEXES.map((_, i) => i).filter(i =>
     (pdbClass === 'all' || COMPLEXES[i].pdb_match.match_class === pdbClass)
-    && (corePdbClass === 'all' || COMPLEXES[i].core_pdb_match.match_class === corePdbClass));
+    && (corePdbClass === 'all' || COMPLEXES[i].core_pdb_match.match_class === corePdbClass)
+    && matchesSearch(COMPLEXES[i], queryWords));
+  // descending; complexes without a value (e.g. no core PDB -> no TM) go last
+  visibleComplexes.sort((a, b) => (sortValue(COMPLEXES[b]) ?? -Infinity) - (sortValue(COMPLEXES[a]) ?? -Infinity));
   const select = $('complex-select');
   select.innerHTML = '';
   visibleComplexes.forEach(i => select.add(new Option(optionText(COMPLEXES[i]), i)));
-  if (!visibleComplexes.length) select.add(new Option('no complex with this combination of PDB filters', ''));
+  if (!visibleComplexes.length) select.add(new Option('no complex matches the PDB filters / search', ''));
   select.disabled = !visibleComplexes.length;
 }
 
@@ -1229,7 +1337,10 @@ function onPdbFilterChange() {
   selectComplex(visibleComplexes.includes(complexIndex) ? complexIndex : visibleComplexes[0]);
 }
 $('pdb-filter').onchange = onPdbFilterChange;
+$('sort-by').onchange = onPdbFilterChange;
 $('core-pdb-filter').onchange = onPdbFilterChange;
+let searchTimer = null;   // wait until typing pauses, otherwise every keystroke loads a structure
+$('complex-search').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(onPdbFilterChange, 250); };
 $('complex-select').onchange = () => selectComplex(Number($('complex-select').value));
 $('prev-complex').onclick = () => selectComplex(visibleComplexes[visibleComplexes.indexOf(complexIndex) - 1]);
 $('next-complex').onclick = () => selectComplex(visibleComplexes[visibleComplexes.indexOf(complexIndex) + 1]);

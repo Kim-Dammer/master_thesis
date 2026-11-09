@@ -34,6 +34,17 @@ scripts/exploratory/*.txt
 scripts/homomultimers/minimal_working_example/*.csv
 scripts/homomultimers/minimal_working_example/*.pdb
 
+notebooks/ccprofiler_files_ym/*.csv
+notebooks/Figures/*.pdf
+notebooks/ccprofiler_files_ym/*.png
+notebooks/Figures/figure_defense
+notebooks/Figures/thesis_figure
+notebooks/Figures/cf_benchmark_figure_work/*.png
+notebooks/Figures/cf_benchmark_figure_work/*.cif
+notebooks/Figures/pdb_structures/co_frac_1652/comparison_5a1u.png
+notebooks/Figures/cf_confidence_vs_tm_leakage.png
+
+
 tmp
 
 .hf_cache/**
